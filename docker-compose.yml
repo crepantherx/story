@@ -1,0 +1,10 @@
+version: '3.8'
+services:
+  endpoint:
+    build:
+      context: .
+      dockerfile: ./api/Dockerfile
+    volumes:
+      - ./endpoint:/api
+    ports:
+      - "8000:8000"
