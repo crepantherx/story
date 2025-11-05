@@ -16,22 +16,37 @@ if __name__ == "__main__":
     #
     # print(result)
 
-    s = 0
-    r= 0
-    ml = 0
-    chars = len(text)
-    seen = set()
-    for i in range(chars):
-        char = text[i]
-        while char in seen:
-            seen.remove(text[s])
-            s+=1
+    # arr = [2, 1, 5, 1, 3, 2]
+    # k = 3
+    #
+    # max_sum = 0
+    # max_i = None
+    # ws = sum(arr[:k])
+    #
+    # for i in range(k, len(arr)):
+    #     ws += arr[i] - arr[i-k]
+    #     if ws > max_sum:
+    #         max_i = i -k + 1
+    #         max_sum = ws
+    #
+    # print(arr[max_i: max_i + k])
 
-        seen.add(text[i])
+    arr = [2, 1, 5, 1, 3, 2]
+    S = 7
+    ws = 0
+    min_length = float('inf')
+    l = 0
 
-        wl = i -s + 1
-        if wl > ml:
-            ml = wl
-            max_start = s
+    for r in range(len(arr)):
 
-    print(text[max_start: max_start + ml])
+        ws += arr[r]
+
+        while ws >= S:
+            min_length = min(min_length, r-l + 1)
+            ws -= arr[l]
+            l += 1
+
+    print(0 if min_length == float('inf') else min_length)
+
+
+

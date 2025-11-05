@@ -1,11 +1,24 @@
-from api.helpers import *
-from fastapi import FastAPI, Request, Depends, HTTPException, status
+from fastapi import FastAPI, Depends, HTTPException, status, Request
 app = FastAPI()
 
-@app.get("/models")
-def models(_: bool = Depends(authenticate)):
-    return MODELS
+def authenticate(request: Request):
 
-@app.get("/models/{model_type}/{model_cat}/{model_name}")
-def model_info(model_type: str, model_cat: str, model_name: str, request: Request, _: bool = Depends(authenticate)):
-    return MODELS["models"][model_type][model_cat][model_name]
+    password = request.headers.get("Authorization")
+
+    password = password.split(" ")[-1]
+
+    if password != "sudhir@123":
+        raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Not Authenticated",
+                headers={"WWW-Authenticate": "Basic"}
+            )
+
+@app.get("/")
+def home():
+    return {"status": "sudhir"}
+
+@app.get("/status")
+def abc(_: bool = Depends(authenticate)):
+    ...
+    return {"ok": "sudhir"}

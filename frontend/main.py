@@ -1,5 +1,7 @@
 import streamlit as st
-from frontend.prediction import get_prediction
+
+def get_prediction(input_text):
+    return {"prediction": "No prediction"}
 
 # Streamlit page configuration
 st.set_page_config(page_title="Tweet Classifier", layout="wide")

@@ -1,12 +1,9 @@
 services:
-  app:
+  api:
     build: ./api
     ports:
       - "8080:8080"
-    develop:
-      watch:
-        - action: sync
-          path: ./api
-          target: /src/api
-        - action: rebuild
-          path: ./api/requirements.txt
+  frontend:
+    build: ./frontend
+    ports:
+      - "8501:8501"
