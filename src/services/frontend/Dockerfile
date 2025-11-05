@@ -1,8 +1,8 @@
 FROM python:3.9
 
-WORKDIR /usr/src/frontend
+WORKDIR /frontend
 
-COPY ./ .
+COPY . .
 
 RUN pip install --no-cache-dir -r requirements.txt
 
