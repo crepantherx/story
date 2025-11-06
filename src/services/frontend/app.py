@@ -430,7 +430,7 @@ def profile_card(row):
     with st.container(border=True):
         c1, c2 = st.columns([1, 2], gap="large")
         with c1:
-            st.image(row["photo_url"], use_container_width=True, caption=f"{row['name']}, {row['age']} • {row['gender']}")
+            st.image(row["photo_url"], width='stretch', caption=f"{row['name']}, {row['age']} • {row['gender']}")
             st.caption(f"📍 {row['city']} • ~{row['distance_km']} km away")
             st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
         with c2:
@@ -580,7 +580,7 @@ with st.sidebar:
     else:
         st.caption(f"Will create: `{st.session_state.viewers_csv}` on first save")
     if st.button("👀 Show saved viewers.csv"):
-        st.dataframe(_load_viewers_df(st.session_state.viewers_csv), use_container_width=True)
+        st.dataframe(_load_viewers_df(st.session_state.viewers_csv), width='stretch')
 
 sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
 df_ranked = filtered_sorted_profiles(st.session_state.profiles_df, get_active()["settings"], sort_by=sort_by)
@@ -613,7 +613,7 @@ with tabs[1]:
         for col, (_, r) in zip(cols, chunk.iterrows()):
             with col:
                 with st.container(border=True):
-                    st.image(r["photo_url"], use_container_width=True)
+                    st.image(r["photo_url"], width='stretch')
                     st.write(f"**{r['name']}**, {r['age']} • {r['gender']}")
                     st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compat {r['compatibility']:.2f}")
                     st.caption(", ".join(r["interests"]))
@@ -658,5 +658,5 @@ with tabs[3]:
     st.write("**Active viewer settings**")
     st.json(get_active()["settings"])
     st.write("**Current dataset (ranked for this viewer)**")
-    st.dataframe(df_ranked, use_container_width=True)
+    st.dataframe(df_ranked, width='stretch')
     st.info("Change the picker at the top to log in as any profile. Interactions → interactions_log.csv; viewers → viewers.csv.")
