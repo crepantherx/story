@@ -1,4 +1,4 @@
-# app.py — Minimal Dating App Prototype (Login-as-any-profile)
+# app.py — Minimal Dating App Prototype (Multi-User "View As" Edition)
 # Run with: streamlit run app.py
 
 import os
@@ -12,7 +12,8 @@ import uuid
 from datetime import datetime
 
 # ================================================================
-# World profile generator (inline)
+# IMPORT/DEFINE: World profile generator (from your earlier snippet)
+# (Inlined here for a single-file app.)
 # ================================================================
 DEFAULT_SEED = 123
 rng = random.Random(DEFAULT_SEED)
@@ -243,6 +244,7 @@ def make_world_profiles(n=10000, seed=DEFAULT_SEED):
         interests = sample_interests(age, region)
         bio = make_bio(name, age, city, interests)
         photo_url = randomuser_url(pid, gender)
+
         rows.append({
             "id": pid,
             "name": name,
@@ -259,6 +261,33 @@ def make_world_profiles(n=10000, seed=DEFAULT_SEED):
     return pd.DataFrame(rows)
 
 # ----------------------------
+# Original demo users
+# ----------------------------
+DEMO_USERS = {
+    "Aditi": {
+        "name": "Aditi", "age": 27, "city": "Mumbai",
+        "seeking": ["Man"],
+        "age_min": 24, "age_max": 34,
+        "top_interests": ["Music", "Travel", "Foodie"],
+        "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
+    },
+    "Rahul": {
+        "name": "Rahul", "age": 30, "city": "Bengaluru",
+        "seeking": ["Woman"],
+        "age_min": 23, "age_max": 33,
+        "top_interests": ["Tech", "Startups", "Cricket"],
+        "weights": {"age": 0.25, "distance": 0.25, "interests": 0.5},
+    },
+    "Sam": {
+        "name": "Sam", "age": 29, "city": "Pune",
+        "seeking": ["Woman","Non-binary","Man"],
+        "age_min": 22, "age_max": 40,
+        "top_interests": ["Art", "Theatre", "Poetry"],
+        "weights": {"age": 0.2, "distance": 0.4, "interests": 0.4},
+    },
+}
+
+# ----------------------------
 # Page config
 # ----------------------------
 st.set_page_config(
@@ -268,7 +297,7 @@ st.set_page_config(
 )
 
 # ----------------------------
-# Viewers persistence (optional)
+# Viewers persistence helpers (Option 1)
 # ----------------------------
 VIEWER_COLS = [
     "viewer_id","name","age","city",
@@ -325,20 +354,14 @@ def ensure_state():
         st.session_state.size = 200
     if "users" not in st.session_state:
         st.session_state.users = {}
-    # Provide a default viewer at boot (will be replaced when you pick one)
     if "active_user" not in st.session_state:
-        st.session_state.users["Default"] = {
-            "settings": {
-                "name": "Default", "age": 28, "city": "Mumbai",
-                "seeking": GENDERS[:],
-                "age_min": 22, "age_max": 40,
-                "top_interests": ["Music","Travel","Foodie"],
-                "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
-            },
-            "likes": [], "passes": [], "superlikes": [],
-            "current_index": 0,
-        }
-        st.session_state.active_user = "Default"
+        for u, settings in DEMO_USERS.items():
+            st.session_state.users[u] = {
+                "settings": settings.copy(),
+                "likes": [], "passes": [], "superlikes": [],
+                "current_index": 0,
+            }
+        st.session_state.active_user = "Rahul"
     if "interactions_csv" not in st.session_state:
         st.session_state.interactions_csv = os.environ.get("INTERACTIONS_CSV", "interactions_log.csv")
     if "viewers_csv" not in st.session_state:
@@ -348,16 +371,18 @@ def get_active():
     return st.session_state.users[st.session_state.active_user]
 
 # ----------------------------
-# Helper: switch any profile to active viewer
+# Helper: switch to any profile as the active viewer
 # ----------------------------
 def switch_to_profile_as_viewer(profile_row: pd.Series):
     vname = f"{profile_row['name']}-{profile_row['id']}"
+    # Create viewer settings from the profile (or overwrite to keep fresh)
     st.session_state.users[vname] = {
         "settings": {
             "name": profile_row["name"],
             "age": int(profile_row["age"]),
             "city": profile_row.get("city", ""),
-            "seeking": GENDERS[:],  # show all by default
+            # default seeking: show all; customize if you like
+            "seeking": GENDERS[:],
             "age_min": max(18, int(profile_row["age"]) - 5),
             "age_max": min(80, int(profile_row["age"]) + 5),
             "top_interests": list(profile_row.get("interests", [])[:3]) if isinstance(profile_row.get("interests", []), list) else [],
@@ -366,8 +391,14 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         "likes": [], "passes": [], "superlikes": [],
         "current_index": 0,
     }
-    upsert_viewer(st.session_state.users[vname]["settings"], viewer_id=vname, path=st.session_state.viewers_csv)
+    # Persist viewer
+    upsert_viewer(
+        st.session_state.users[vname]["settings"],
+        viewer_id=vname,
+        path=st.session_state.viewers_csv,
+    )
     st.session_state.active_user = vname
+    st.success(f"Now viewing as {vname}")
     st.rerun()
 
 # ----------------------------
@@ -394,7 +425,7 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
         writer.writerow(row)
 
 # ----------------------------
-# Matching logic
+# Matching logic (unchanged)
 # ----------------------------
 def compute_compatibility(row, settings):
     w = settings["weights"]
@@ -406,11 +437,14 @@ def compute_compatibility(row, settings):
         mid = (target_min + target_max) / 2.0
         spread = max((target_max - target_min) / 2.0, 1.0)
         age_score = max(0.0, 1.0 - abs(row["age"] - mid) / spread)
+
     dist = row["distance_km"]
     distance_score = max(0.0, 1.0 - (dist / 30.0))
+
     your_interests = set(st.session_state.users[st.session_state.active_user]["settings"]["top_interests"])
     their_interests = set(row["interests"])
     overlap = (len(your_interests & their_interests) / len(your_interests)) if your_interests else 0.0
+
     score = w["age"] * age_score + w["distance"] * distance_score + w["interests"] * overlap
     return round(float(score), 3)
 
@@ -443,19 +477,37 @@ def action_bar(row, user_state):
     with c1:
         if st.button("👎 Pass", key=f"pass_{row['id']}"):
             user_state["passes"].append(row["id"])
-            log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "pass", row.get("compatibility", 0.0))
+            log_interaction(
+                viewer_key=st.session_state.active_user,
+                viewer_name=user_state["settings"]["name"],
+                profile_row=row,
+                action="pass",
+                compatibility=row.get("compatibility", 0.0),
+            )
             user_state["current_index"] += 1
             st.rerun()
     with c2:
         if st.button("⭐ Superlike", key=f"super_{row['id']}"):
             user_state["superlikes"].append(row["id"])
-            log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "superlike", row.get("compatibility", 0.0))
+            log_interaction(
+                viewer_key=st.session_state.active_user,
+                viewer_name=user_state["settings"]["name"],
+                profile_row=row,
+                action="superlike",
+                compatibility=row.get("compatibility", 0.0),
+            )
             user_state["current_index"] += 1
             st.rerun()
     with c3:
         if st.button("❤️ Like", key=f"like_{row['id']}"):
             user_state["likes"].append(row["id"])
-            log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "like", row.get("compatibility", 0.0))
+            log_interaction(
+                viewer_key=st.session_state.active_user,
+                viewer_name=user_state["settings"]["name"],
+                profile_row=row,
+                action="like",
+                compatibility=row.get("compatibility", 0.0),
+            )
             user_state["current_index"] += 1
             st.rerun()
     with c4:
@@ -491,39 +543,69 @@ def export_buttons(df, viewer_name, user_state):
 ensure_state()
 
 st.title("Recommendation")
-st.caption("Pick any profile — you instantly 'log in' as them. All interactions are logged to CSV.")
+st.caption("You can now log in as **any profile** — switching viewer updates recommendations immediately.")
 
-# --- Viewer (single control: login as ANY profile) ---
+# --- Viewer (no-login user switcher) ---
 with st.container(border=True):
-    st.subheader("Login as any profile")
-    df_choices = st.session_state.profiles_df.reset_index(drop=True)
-    if df_choices.empty:
-        st.warning("No profiles loaded.")
-    else:
-        labels = [
-            f"{r['name']} ({r['id']}) — {r['city']}, {r['country']}"
-            for _, r in df_choices.iterrows()
-        ]
-        default_ix = st.session_state.get("pick_profile_ix", 0)
-        default_ix = min(default_ix, len(labels) - 1)
+    st.subheader("Viewer")
+    left, mid, right = st.columns([2,2,2])
+
+    # Left: pick among existing viewers
+    with left:
+        all_users = list(st.session_state.users.keys())
+        if st.session_state.active_user not in all_users and all_users:
+            st.session_state.active_user = all_users[0]
+        viewer = st.selectbox("Viewing as (existing viewers)", all_users, index=all_users.index(st.session_state.active_user))
+        st.session_state.active_user = viewer
+
+    # Middle: create manual viewer (kept)
+    with mid:
+        new_name = st.text_input("Create new viewer (manual)", placeholder="e.g., Neha")
+        if st.button("➕ Add Viewer") and new_name:
+            if new_name in st.session_state.users:
+                st.warning("That name already exists.")
+            else:
+                st.session_state.users[new_name] = {
+                    "settings": {
+                        "name": new_name, "age": 28, "city": "Bengaluru",
+                        "seeking": ["Woman","Man"],
+                        "age_min": 22, "age_max": 40,
+                        "top_interests": ["Music","Travel","Foodie"],
+                        "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
+                    },
+                    "likes": [], "passes": [], "superlikes": [],
+                    "current_index": 0,
+                }
+                upsert_viewer(
+                    st.session_state.users[new_name]["settings"],
+                    viewer_id=new_name,
+                    path=st.session_state.viewers_csv,
+                )
+                st.session_state.active_user = new_name
+                st.rerun()
+
+    # Right: instant login as any profile (no extra button)
+    with right:
+        st.markdown("**Login as any profile**")
+        df_choices = st.session_state.profiles_df
+        choices = [f"{r['name']} ({r['id']}) — {r['city']}, {r['country']}" for _, r in df_choices.iterrows()]
 
         def _on_pick_profile_as_viewer():
-            ix = st.session_state["pick_profile_ix"]
+            ix = st.session_state.get("pick_profile_ix", 0)
             pr = df_choices.iloc[ix]
             switch_to_profile_as_viewer(pr)
 
         st.selectbox(
-            "Pick profile to log in as",
-            options=list(range(len(labels))),
-            index=default_ix,
+            "Pick profile to login as",
+            options=list(range(len(choices))) if len(choices) else [0],
+            format_func=lambda i: choices[i] if len(choices) else "—",
             key="pick_profile_ix",
-            format_func=lambda i: labels[i],
             on_change=_on_pick_profile_as_viewer,
         )
 
-# --- Sidebar: per-user settings + dataset & logging paths ---
+# --- Sidebar: per-user settings + dataset controls + logging/persistence paths ---
 with st.sidebar:
-    st.header("Viewer Settings")
+    st.header("Your Settings (for this viewer)")
     ustate = get_active()
     s = ustate["settings"]
     dataset_cities = sorted(st.session_state.profiles_df["city"].dropna().unique().tolist())
@@ -550,12 +632,16 @@ with st.sidebar:
     total = age_w + dist_w + int_w or 1.0
     s["weights"] = {"age": age_w/total, "distance": dist_w/total, "interests": int_w/total}
 
-    # persist viewer after any changes
-    upsert_viewer(s, viewer_id=st.session_state.active_user, path=st.session_state.viewers_csv)
+    # Persist viewer after any changes
+    upsert_viewer(
+        settings=s,
+        viewer_id=st.session_state.active_user,
+        path=st.session_state.viewers_csv,
+    )
 
     st.divider()
-    st.subheader("Dataset Controls")
-    st.caption("Regenerate the synthetic dataset.")
+    st.subheader("Dataset Controls (shared)")
+    st.caption("Regenerate the synthetic dataset using your world-profile generator.")
     st.session_state.seed = st.number_input("Random seed", 0, 1_000_000, int(st.session_state.seed), step=1)
     st.session_state.size = st.number_input("Number of profiles", 50, 50_000, int(st.session_state.size), step=50)
     if st.button("🔁 Regenerate dataset"):
@@ -583,6 +669,7 @@ with st.sidebar:
         st.dataframe(_load_viewers_df(st.session_state.viewers_csv), use_container_width=True)
 
 sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
+
 df_ranked = filtered_sorted_profiles(st.session_state.profiles_df, get_active()["settings"], sort_by=sort_by)
 
 # Overall stats row (per viewer)
@@ -659,4 +746,7 @@ with tabs[3]:
     st.json(get_active()["settings"])
     st.write("**Current dataset (ranked for this viewer)**")
     st.dataframe(df_ranked, use_container_width=True)
-    st.info("Change the picker at the top to log in as any profile. Interactions → interactions_log.csv; viewers → viewers.csv.")
+    st.info(
+        "Click '👤 View as' on any profile (or use the top dropdown) to log in as that profile. "
+        "All interactions still go to interactions_log.csv; viewers persist in viewers.csv."
+    )
