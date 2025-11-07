@@ -1,4 +1,4 @@
-# app.py — Minimal Dating App Prototype (fast, static profiles.csv, cached ranking + paginated grid)
+# app.py — Minimal Dating App Prototype (static profiles.csv, fast, persistent interactions, robust hydration)
 # Run with: streamlit run app.py
 
 import os
@@ -146,19 +146,58 @@ def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
                 s.update([str(x) for x in lst])
     return sorted(s)
 
-def hydrate_interactions_for_viewer(viewer_id: str, path: str):
-    """Return dict with likes/passes/superlikes lists for a viewer from interactions.csv."""
-    likes, passes, superlikes = [], [], []
-    if os.path.exists(path):
+# ---------- robust interactions loader ----------
+def read_interactions_df(path: str) -> pd.DataFrame:
+    """
+    Always return a DataFrame with INTERACTION_FIELDS columns (may be empty).
+    Handles:
+      - missing file
+      - empty file
+      - file without header (header=None) IF column count matches
+      - files with unexpected schema → return empty safe DF
+    """
+    if not os.path.exists(path):
+        return pd.DataFrame(columns=INTERACTION_FIELDS)
+
+    # Try normal read
+    try:
+        df = pd.read_csv(path, dtype={"viewer_id": str, "profile_id": str})
+        # If it's empty but has no columns, return empty with schema
+        if df.empty and not set(INTERACTION_FIELDS).issubset(set(df.columns)):
+            return pd.DataFrame(columns=INTERACTION_FIELDS)
+        # If required columns are missing, try header=None path
+        if not set(INTERACTION_FIELDS).issubset(set(df.columns)):
+            # Try to read without header and fix columns if width matches
+            df2 = pd.read_csv(path, header=None)
+            if df2.shape[1] == len(INTERACTION_FIELDS):
+                df2.columns = INTERACTION_FIELDS
+                return df2
+            else:
+                # schema mismatch → safest is empty DF with correct columns
+                return pd.DataFrame(columns=INTERACTION_FIELDS)
+        return df
+    except Exception:
+        # Try header=None fallback
         try:
-            df = pd.read_csv(path, dtype={"viewer_id": str, "profile_id": str})
-            df = df[df["viewer_id"] == viewer_id]
-            likes = df.loc[df["action"] == "like", "profile_id"].astype(str).tolist()
-            passes = df.loc[df["action"] == "pass", "profile_id"].astype(str).tolist()
-            superlikes = df.loc[df["action"] == "superlike", "profile_id"].astype(str).tolist()
+            df2 = pd.read_csv(path, header=None)
+            if df2.shape[1] == len(INTERACTION_FIELDS):
+                df2.columns = INTERACTION_FIELDS
+                return df2
         except Exception:
             pass
-    return {"likes": likes, "passes": passes, "superlikes": superlikes}
+        return pd.DataFrame(columns=INTERACTION_FIELDS)
+
+def hydrate_interactions_for_viewer(viewer_id: str, path: str):
+    """Return dict with likes/passes/superlikes lists for a viewer from interactions.csv."""
+    df = read_interactions_df(path)
+    if df.empty or "viewer_id" not in df.columns:
+        return {"likes": [], "passes": [], "superlikes": []}
+    sub = df[df["viewer_id"].astype(str) == str(viewer_id)]
+    return {
+        "likes": sub.loc[sub["action"] == "like", "profile_id"].astype(str).tolist(),
+        "passes": sub.loc[sub["action"] == "pass", "profile_id"].astype(str).tolist(),
+        "superlikes": sub.loc[sub["action"] == "superlike", "profile_id"].astype(str).tolist(),
+    }
 
 def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
     path = st.session_state.get(
@@ -168,11 +207,11 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
     exists = os.path.exists(path)
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "viewer_id": viewer_key,
-        "viewer_name": viewer_name,
+        "viewer_id": str(viewer_key),
+        "viewer_name": str(viewer_name),
         "profile_id": str(profile_row["id"]),
         "profile_name": str(profile_row.get("name","")),
-        "action": action,
+        "action": str(action),
         "compatibility": float(compatibility) if compatibility is not None else None,
     }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -241,8 +280,6 @@ def ensure_state():
             "current_index": 0,
         }
         st.session_state.active_user = "Default"
-        hist = hydrate_interactions_for_viewer(st.session_state.active_user, st.session_state.interactions_csv)
-        st.session_state.users["Default"].update(hist)
 
     # ranking cache (dict): key -> ranked df
     if "ranked_cache" not in st.session_state:
@@ -258,15 +295,36 @@ def ensure_state():
     if "low_bandwidth" not in st.session_state:
         st.session_state.low_bandwidth = True  # default ON for speed
 
+    # ALWAYS merge (not overwrite) current viewer with disk history
+    rehydrate_current_viewer_merge()
+
 def get_active():
     return st.session_state.users[st.session_state.active_user]
+
+# ================================================================
+# Hydration helpers
+# ================================================================
+def rehydrate_current_viewer_merge():
+    """
+    Read likes/passes/superlikes for the active viewer from interactions.csv every run
+    and MERGE with in-memory lists so counters increment immediately and persist after restart.
+    """
+    vid = st.session_state.active_user
+    u = st.session_state.users.get(vid)
+    if not u:
+        return
+    disk = hydrate_interactions_for_viewer(vid, st.session_state.interactions_csv)
+    # merge (union) with current session state
+    u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
+    u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
+    u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
 
 # ================================================================
 # Login-as helper
 # ================================================================
 def switch_to_profile_as_viewer(profile_row: pd.Series):
     vname = f"{profile_row['name']}-{profile_row['id']}"
-    st.session_state.users[vname] = {
+    st.session_state.users.setdefault(vname, {
         "settings": {
             "name": profile_row["name"],
             "age": int(profile_row["age"]),
@@ -279,11 +337,11 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         },
         "likes": [], "passes": [], "superlikes": [],
         "current_index": 0,
-    }
+    })
     upsert_viewer(st.session_state.users[vname]["settings"], viewer_id=vname, path=st.session_state.viewers_csv)
-    hist = hydrate_interactions_for_viewer(vname, st.session_state.interactions_csv)
-    st.session_state.users[vname].update(hist)
     st.session_state.active_user = vname
+    # merge with disk history immediately so counters reflect past data as soon as you switch
+    rehydrate_current_viewer_merge()
     # reset grid paging
     st.session_state.grid_page = 1
 
@@ -331,13 +389,10 @@ def _profiles_fingerprint(df: pd.DataFrame) -> str:
     """Small fingerprint of the base data without hashing list columns."""
     if df.empty:
         return "empty"
-    # use only stable, hashable columns
     cols = ["id","age","gender","city","country","distance_km"]
     take = df[cols].astype(str)
     md5 = hashlib.md5()
-    # hash a small sample + length to keep it cheap but stable enough
     md5.update(str(len(df)).encode("utf-8"))
-    # sample 500 rows deterministically
     sample = take.iloc[::max(len(take)//500, 1)].to_csv(index=False).encode("utf-8")
     md5.update(sample)
     return md5.hexdigest()
@@ -415,6 +470,7 @@ def action_bar(row, user_state):
                 user_state["passes"].append(row["id"])
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "pass", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
+            rehydrate_current_viewer_merge()
             st.rerun()
     with c2:
         if st.button("⭐ Superlike", key=f"super_{row['id']}"):
@@ -422,6 +478,7 @@ def action_bar(row, user_state):
                 user_state["superlikes"].append(row["id"])
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "superlike", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
+            rehydrate_current_viewer_merge()
             st.rerun()
     with c3:
         if st.button("❤️ Like", key=f"like_{row['id']}"):
@@ -429,6 +486,7 @@ def action_bar(row, user_state):
                 user_state["likes"].append(row["id"])
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "like", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
+            rehydrate_current_viewer_merge()
             st.rerun()
     with c4:
         if st.button("👤 View as this person", key=f"viewas_single_{row['id']}"):
@@ -552,6 +610,12 @@ with st.sidebar:
     st.session_state.grid_page_size = st.number_input("Grid page size", 3, 30, st.session_state.grid_page_size, 3)
 
     st.divider()
+    st.subheader("History")
+    if st.button("↻ Reload history for active viewer"):
+        rehydrate_current_viewer_merge()
+        st.success("History reloaded from interactions.csv")
+
+    st.divider()
     st.subheader("Logging")
     st.text_input("Interactions CSV path", key="interactions_csv", value=st.session_state.get("interactions_csv", "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/interactions.csv"))
     if os.path.exists(st.session_state.interactions_csv):
@@ -637,11 +701,13 @@ with tabs[1]:
                                 if r["id"] not in get_active()["likes"]:
                                     get_active()["likes"].append(r["id"])
                                 log_interaction(st.session_state.active_user, get_active()["settings"]["name"], r, "like", r.get("compatibility", 0.0))
+                                rehydrate_current_viewer_merge()
                         with c2:
                             if st.button("👎", key=f"grid_pass_{st.session_state.active_user}_{r['id']}_{start}"):
                                 if r["id"] not in get_active()["passes"]:
                                     get_active()["passes"].append(r["id"])
                                 log_interaction(st.session_state.active_user, get_active()["settings"]["name"], r, "pass", r.get("compatibility", 0.0))
+                                rehydrate_current_viewer_merge()
                         with c3:
                             if st.button("👤 View as", key=f"grid_viewas_{r['id']}_{start}"):
                                 switch_to_profile_as_viewer(r)
@@ -649,9 +715,23 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Your Decisions")
     ustate = get_active()
+    base_df = st.session_state.profiles_df  # use the full dataset so history is visible regardless of filters
     liked_ids = set(ustate["likes"] + ustate["superlikes"])
-    liked_df = df_ranked[df_ranked["id"].isin(liked_ids)]
-    passed_df = df_ranked[df_ranked["id"].isin(ustate["passes"])]
+    passed_ids = set(ustate["passes"])
+
+    liked_df = base_df[base_df["id"].isin(liked_ids)].copy()
+    passed_df = base_df[base_df["id"].isin(passed_ids)].copy()
+
+    # Optionally compute compatibility for display (not required for showing)
+    if not liked_df.empty:
+        liked_df = liked_df.merge(
+            df_ranked[["id","compatibility"]], on="id", how="left"
+        )
+    if not passed_df.empty:
+        passed_df = passed_df.merge(
+            df_ranked[["id","compatibility"]], on="id", how="left"
+        )
+
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### ❤️ Likes & ⭐ Superlikes")
@@ -659,7 +739,9 @@ with tabs[2]:
             st.caption("No likes yet.")
         for _, r in liked_df.iterrows():
             with st.container(border=True):
-                st.write(f"**{r['name']}**, {r['age']} • {r['gender']} — Compat {r['compatibility']:.2f}")
+                comp = r.get("compatibility")
+                comp_txt = f" — Compat {comp:.2f}" if pd.notna(comp) else ""
+                st.write(f"**{r['name']}**, {r['age']} • {r['gender']}{comp_txt}")
                 st.caption(f"📍 {r['city']} • ~{r['distance_km']} km")
     with c2:
         st.markdown("### 👎 Passes")
@@ -667,11 +749,13 @@ with tabs[2]:
             st.caption("No passes yet.")
         for _, r in passed_df.iterrows():
             with st.container(border=True):
-                st.write(f"**{r['name']}**, {r['age']} • {r['gender']} — Compat {r['compatibility']:.2f}")
+                comp = r.get("compatibility")
+                comp_txt = f" — Compat {comp:.2f}" if pd.notna(comp) else ""
+                st.write(f"**{r['name']}**, {r['age']} • {r['gender']}{comp_txt}")
                 st.caption(f"📍 {r['city']} • ~{r['distance_km']} km")
 
     st.divider()
-    export_buttons(st.session_state.profiles_df, st.session_state.active_user, ustate)
+    export_buttons(base_df, st.session_state.active_user, ustate)
 
 with tabs[3]:
     st.subheader("Debug / Developer Hooks")
@@ -679,6 +763,40 @@ with tabs[3]:
     st.json(get_active()["settings"])
     st.write("**Current dataset (ranked for this viewer) — showing first 200 rows**")
     st.dataframe(df_ranked.head(200), width='stretch')
+
+    st.markdown("**Recent interactions (active viewer)**")
+    interactions_df = read_interactions_df(st.session_state.interactions_csv)
+    if interactions_df.empty:
+        st.caption("No interactions file or it's empty.")
+    else:
+        st.dataframe(
+            interactions_df[interactions_df["viewer_id"].astype(str) == str(st.session_state.active_user)]
+            .sort_values("timestamp", ascending=False)
+            .head(25),
+            width='stretch'
+        )
+
+    # Quick repair if file has 6 cols without header, etc.
+    st.divider()
+    st.markdown("**Maintenance**")
+    if st.button("Repair interactions.csv header (if needed)"):
+        df0 = read_interactions_df(st.session_state.interactions_csv)
+        # If it's empty we just ensure header exists by rewriting an empty file with header
+        if df0.empty:
+            with open(st.session_state.interactions_csv, "w", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=INTERACTION_FIELDS)
+                writer.writeheader()
+            st.success("Rewrote empty interactions.csv with correct header.")
+        else:
+            # Ensure column order & presence; rewrite
+            df_fixed = df0.copy()
+            for col in INTERACTION_FIELDS:
+                if col not in df_fixed.columns:
+                    df_fixed[col] = None
+            df_fixed = df_fixed[INTERACTION_FIELDS]
+            df_fixed.to_csv(st.session_state.interactions_csv, index=False)
+            st.success("interactions.csv header/columns repaired.")
+
     st.info(
         "Profiles → "
         f"{st.session_state.profiles_csv}; "
