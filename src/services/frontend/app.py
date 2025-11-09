@@ -14,7 +14,7 @@ import streamlit as st
 # Config / constants
 # ================================================================
 GENDERS = ["Woman", "Man", "Non-binary"]
-GRID_PAGE_SIZE_DEFAULT = 9  # number of cards shown in Grid per page
+GRID_PAGE_SIZE_DEFAULT = 9
 
 st.set_page_config(
     page_title="App Prototype",
