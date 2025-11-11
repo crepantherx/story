@@ -201,6 +201,32 @@ def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
+# Call GET /update/{profile} helper (mirrors match helper)
+# ================================================================
+def call_update_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
+    """
+    Calls the backend using GET and the profile id as a path param for /update/{profile}.
+    Returns dict with details for debug.
+    """
+    if not endpoint_template:
+        return {"ok": False, "error": "no update endpoint template configured"}
+    try:
+        if "{profile}" in endpoint_template:
+            url = endpoint_template.format(profile=profile_id)
+        else:
+            base = endpoint_template.rstrip("/") + "/"
+            url = urljoin(base, str(profile_id).lstrip("/"))
+        # MUST use GET for @app.get("/update/{profile}")
+        resp = requests.get(url, timeout=6.0)
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+        return {"ok": True, "method": "GET", "url": url, "status_code": resp.status_code, "text": resp.text, "json": parsed}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
+
+# ================================================================
 # Interaction logging — write CSV AND call GET /match/{profile}
 # ================================================================
 def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
@@ -298,6 +324,10 @@ def ensure_state():
     if "interactions_webhook" not in st.session_state:
         st.session_state.interactions_webhook = "http://127.0.0.1:8000/match/{profile}"
 
+    # default update webhook
+    if "update_webhook" not in st.session_state:
+        st.session_state.update_webhook = "http://127.0.0.1:8000/update/{profile}"
+
     if "ranked_cache" not in st.session_state:
         st.session_state.ranked_cache = {}
     if "grid_page" not in st.session_state:
@@ -309,6 +339,8 @@ def ensure_state():
 
     if "last_match_call" not in st.session_state:
         st.session_state["last_match_call"] = {"ok": False, "error": "no calls yet"}
+    if "last_update_call" not in st.session_state:
+        st.session_state["last_update_call"] = {"ok": False, "error": "no calls yet"}
 
     rehydrate_current_viewer_merge()
 
@@ -596,6 +628,13 @@ with st.sidebar:
     st.caption("When you Like/Pass/Superlike the app will call GET /match/<profile_id> and show the response in Debug.")
 
     st.divider()
+    st.subheader("Update endpoint (path)")
+    st.caption("Enter either a template with '{profile}' or a base path. Example:\n"
+               "`http://127.0.0.1:8000/update/{profile}`")
+    st.text_input("Profile update URL (template or base)", key="update_webhook", value=st.session_state.get("update_webhook", "http://127.0.0.1:8000/update/{profile}"))
+    st.caption("This will be called for the active viewer just before ranking recommendations so embeddings can be refreshed.")
+
+    st.divider()
     st.subheader("Logging")
     st.text_input("Interactions CSV path", key="interactions_csv", value=st.session_state.get("interactions_csv", "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/interactions.csv"))
     if os.path.exists(st.session_state.interactions_csv):
@@ -613,8 +652,18 @@ with st.sidebar:
     if st.button("👀 Show saved viewers.csv"):
         st.dataframe(_load_viewers_df(st.session_state.viewers_csv), width='stretch')
 
-# Ranking & UI (unchanged)
+# Ranking & UI (unchanged except we call update endpoint before ranking)
 sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
+
+# --- NEW: call /update/{viewer} before ranking to refresh embedding
+viewer_id = st.session_state.active_user
+update_template = st.session_state.get("update_webhook", "").strip()
+if update_template:
+    result = call_update_endpoint_get(str(viewer_id), update_template)
+    st.session_state["last_update_call"] = result
+else:
+    st.session_state["last_update_call"] = {"ok": False, "error": "no update endpoint configured"}
+
 df_ranked = get_ranked_profiles(st.session_state.profiles_df, get_active()["settings"], sort_by, st.session_state.active_user)
 
 m1, m2, m3, m4 = st.columns(4)
@@ -737,6 +786,11 @@ with tabs[3]:
         st.caption("No interactions file or it's empty.")
     else:
         st.dataframe(interactions_df[interactions_df["viewer_id"].astype(str) == str(st.session_state.active_user)].sort_values("timestamp", ascending=False).head(25), width='stretch')
+
+    st.divider()
+    st.markdown("### Last update endpoint call result")
+    st.caption("Shows the last GET /update/{profile} call result (method/url/status/text/json or error).")
+    st.json(st.session_state.get("last_update_call", {"ok": False, "error": "no calls yet"}))
 
     st.divider()
     st.markdown("### Last match endpoint call result")

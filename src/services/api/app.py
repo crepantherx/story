@@ -100,3 +100,56 @@ def abc(profile: str):
     results = top_n_similar(annoy_index, id_map, query_id, n=5, seen_ids=seen_ids)
 
     return {"profile": results[0]}
+
+@app.get("/update/{profile}")
+def update(profile: str):
+    def update_embedding(query_id):
+        interactions = pd.read_csv(
+            "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/interactions.csv",
+            names=['datetime', 'viewer_id', 'viewer_name', 'profile_id', 'profile_name', 'status', 'score'])
+        interactions['viewer_id'] = interactions['viewer_id'].apply(lambda w: w.split("-")[-1])
+        update = interactions.groupby('viewer_id')['profile_id'].apply(list).reset_index()
+
+        need_to_update = update.loc[update['viewer_id'] == query_id, 'profile_id'].to_list()
+        if need_to_update:
+            import re
+            import numpy as np
+            from numpy.linalg import norm
+
+            def str_to_array(s):
+                if s is None:
+                    return None
+                s = s.strip()
+                if s.startswith('[') and s.endswith(']'):
+                    s = s[1:-1]
+                s = re.sub(r'[\r\n]+', ' ', s)
+                s = re.sub(r'\s+', ' ', s).strip()
+                return np.fromstring(s, sep=' ').astype(float)
+
+            def avg(l):
+
+                es = p[p['id'].isin(l)]['embedding'].values
+                avg = np.mean(es, axis=0)
+                n = avg / norm(avg)
+                return n
+
+            p = pd.read_csv("/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/profile_embedding.csv")
+            p['embedding'] = p['embedding'].apply(str_to_array)
+
+            update['updated_embedding'] = update['profile_id'].apply(avg)
+
+            update = update.rename(columns={'viewer_id': 'id'})
+            update = update.rename(columns={'updated_embedding': 'embedding'})
+            update = update[['id', 'embedding']]
+            update_dict = dict(zip(update['id'], update['embedding']))
+            p['embedding'] = p.apply(
+                lambda row: update_dict.get(row['id'], row['embedding']),
+                axis=1
+            )
+            p.to_csv("/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/profile_embedding.csv",
+                     index=False)
+            print('updated')
+        else:
+            ...
+
+    update_embedding(profile)
