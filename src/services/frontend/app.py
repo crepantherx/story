@@ -1,4 +1,4 @@
-# app.py — Minimal Dating App Prototype (static profiles.csv, fast, persistent interactions, robust hydration)
+# app.py — Minimal Dating App Prototype (calls GET /match/{profile} when interactions happen)
 # Run with: streamlit run app.py
 
 import os
@@ -6,9 +6,11 @@ import csv
 import json
 import hashlib
 from datetime import datetime
+from urllib.parse import urljoin
 
 import pandas as pd
 import streamlit as st
+import requests
 
 # ================================================================
 # Config / constants
@@ -199,10 +201,47 @@ def hydrate_interactions_for_viewer(viewer_id: str, path: str):
         "superlikes": sub.loc[sub["action"] == "superlike", "profile_id"].astype(str).tolist(),
     }
 
+# ================================================================
+# Match endpoint helper (calls GET /match/{profile})
+# ================================================================
+def call_match_endpoint_using_path(profile_id: str, endpoint_template: str) -> dict:
+    """
+    Call the backend using the profile id as a path parameter.
+    endpoint_template may include '{profile}' placeholder.
+    If it doesn't, the function will append '/{profile}'.
+    Performs a GET request (since backend route is @app.get).
+    Returns {'ok': True, 'status_code': int, 'text': str, 'json': parsed_or_None} or {'ok': False, 'error': str}.
+    """
+    if not endpoint_template:
+        return {"ok": False, "error": "no endpoint template configured"}
+    try:
+        if "{profile}" in endpoint_template:
+            url = endpoint_template.format(profile=profile_id)
+        else:
+            base = endpoint_template.rstrip("/") + "/"
+            url = urljoin(base, str(profile_id).lstrip("/"))
+        resp = requests.get(url, timeout=6.0)
+        try:
+            parsed = resp.json()
+        except Exception:
+            parsed = None
+        return {"ok": True, "status_code": resp.status_code, "text": resp.text, "json": parsed, "url": url}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
+
+# ================================================================
+# Interaction logging (CSV + path-based GET to /match/{profile})
+# ================================================================
 def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
+    """
+    Persist interaction to CSV (as before) and then call GET on configured match endpoint:
+      - If sidebar value is 'http://host:port/match/{profile}', it will call that formatted URL.
+      - If it's 'http://host:port/match' it will call 'http://host:port/match/<profile>'.
+    The result is saved to st.session_state['last_webhook_result'] for debug.
+    """
     path = st.session_state.get(
         "interactions_csv",
-        "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/interactions.csv"
+        "./interactions.csv"
     )
     exists = os.path.exists(path)
     row = {
@@ -215,11 +254,22 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
         "compatibility": float(compatibility) if compatibility is not None else None,
     }
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=INTERACTION_FIELDS)
-        if not exists:
-            writer.writeheader()
-        writer.writerow(row)
+    try:
+        with open(path, "a", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=INTERACTION_FIELDS)
+            if not exists:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        st.session_state["last_csv_error"] = str(e)
+
+    # Now call the match endpoint (GET /match/{profile}) synchronously
+    match_template = st.session_state.get("interactions_webhook", "").strip()
+    if match_template:
+        result = call_match_endpoint_using_path(str(profile_row["id"]), match_template)
+        st.session_state["last_webhook_result"] = result
+    else:
+        st.session_state["last_webhook_result"] = {"ok": False, "error": "no match endpoint configured"}
 
 # ================================================================
 # Lightweight caching (no DF hashing)
@@ -250,7 +300,6 @@ def health_banner():
 # ================================================================
 # Session state
 # ================================================================
-
 def ensure_state():
     """Bootstrap session state and auto-login to a specific profile (default: ssse1024)."""
     # -------- fixed paths --------
@@ -284,6 +333,10 @@ def ensure_state():
             "current_index": 0,
         }
         st.session_state.active_user = "Default"
+
+    # default match endpoint template (can include {profile})
+    if "interactions_webhook" not in st.session_state:
+        st.session_state.interactions_webhook = "http://127.0.0.1:8000/match/{profile}"
 
     # -------- attempt to auto-login to your specific profile --------
     try:
@@ -335,10 +388,12 @@ def ensure_state():
     if "low_bandwidth" not in st.session_state:
         st.session_state.low_bandwidth = True
 
+    # keep last webhook result for debug
+    if "last_webhook_result" not in st.session_state:
+        st.session_state["last_webhook_result"] = {"ok": False, "error": "no calls yet"}
+
     # -------- final: merge-on-every-run to keep counters in sync with disk --------
     rehydrate_current_viewer_merge()
-
-
 
 def get_active():
     return st.session_state.users[st.session_state.active_user]
@@ -505,6 +560,13 @@ def profile_card(row, show_image=True):
                 st.write("**Interests**:", "")
 
 def action_bar(row, user_state):
+    """
+    When a button is clicked we:
+      - update the in-memory lists
+      - persist via log_interaction (writes CSV + GET /match/{profile})
+      - advance current_index and rehydrate merge
+      - rerun so next profile appears
+    """
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
         if st.button("👎 Pass", key=f"pass_{row['id']}"):
@@ -563,7 +625,7 @@ def export_buttons(df, viewer_name, user_state):
 ensure_state()
 
 st.title("Recommendation")
-st.caption("Pick any profile — you instantly 'log in' as them. Interactions log to CSV.")
+st.caption("Pick any profile — you instantly 'log in' as them. Interactions log to CSV and call GET /match/{profile}.")
 health_banner()
 
 # --- Viewer (single control: login as ANY profile) ---
@@ -594,7 +656,7 @@ with st.container(border=True):
             on_change=_on_pick_profile_as_viewer,
         )
 
-# --- Sidebar: settings + paths + perf toggles ---
+# --- Sidebar: settings + webhook template ---
 with st.sidebar:
     st.header("Viewer Settings")
     ustate = get_active()
@@ -656,6 +718,13 @@ with st.sidebar:
     if st.button("↻ Reload history for active viewer"):
         rehydrate_current_viewer_merge()
         st.success("History reloaded from interactions.csv")
+
+    st.divider()
+    st.subheader("Match endpoint (path)")
+    st.caption("Enter either a template with '{profile}' or a base path. Examples:\n"
+               "`http://127.0.0.1:8000/match/{profile}` or `http://127.0.0.1:8000/match`")
+    st.text_input("Interactions webhook URL (template or base)", key="interactions_webhook", value=st.session_state.get("interactions_webhook", "http://127.0.0.1:8000/match/{profile}"))
+    st.caption("When you Like/Pass/Superlike the app will call GET /match/<profile_id> and show the response in Debug.")
 
     st.divider()
     st.subheader("Logging")
@@ -818,7 +887,11 @@ with tabs[3]:
             width='stretch'
         )
 
-    # Quick repair if file has 6 cols without header, etc.
+    st.divider()
+    st.markdown("### Last match endpoint call result")
+    st.caption("Shows the last GET /match/{profile} call result (status, body or error).")
+    st.json(st.session_state.get("last_webhook_result", {"ok": False, "error": "no calls yet"}))
+
     st.divider()
     st.markdown("**Maintenance**")
     if st.button("Repair interactions.csv header (if needed)"):

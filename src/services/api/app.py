@@ -99,4 +99,4 @@ def abc(profile: str):
     seen_ids = already_seen(query_id)
     results = top_n_similar(annoy_index, id_map, query_id, n=5, seen_ids=seen_ids)
 
-    return {"profile": results}
+    return {"profile": results[0]}
