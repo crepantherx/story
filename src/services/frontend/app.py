@@ -1,4 +1,4 @@
-# app.py — Minimal Dating App Prototype (calls GET /match/{profile} when interactions happen)
+# app.py — Minimal Dating App Prototype (calls GET /match/{profile} on interactions)
 # Run with: streamlit run app.py
 
 import os
@@ -25,7 +25,7 @@ st.set_page_config(
 )
 
 # ================================================================
-# Persistence helpers
+# Persistence helpers & constants
 # ================================================================
 VIEWER_COLS = [
     "viewer_id","name","age","city",
@@ -48,22 +48,18 @@ def _as_json(value):
     return json.dumps(value, ensure_ascii=False)
 
 def _parse_interests(val):
-    """Parse interests from CSV cell into a python list[str]."""
     if isinstance(val, list):
         return val
-    # Try JSON first
     try:
         x = json.loads(val)
         return x if isinstance(x, list) else []
     except Exception:
         pass
-    # Fallback for python-list-like strings: "['A', 'B']"
     s = str(val).strip()
     if s.startswith('[') and s.endswith(']'):
         inner = s[1:-1]
         parts = [p.strip().strip("'").strip('"') for p in inner.split(",") if p.strip()]
         return [p for p in parts if p]
-    # Comma-separated fallback
     if "," in s:
         return [p.strip() for p in s.split(",") if p.strip()]
     return []
@@ -80,7 +76,6 @@ def _row_hash(d: dict) -> str:
     return hashlib.md5(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest()
 
 def upsert_viewer(settings: dict, viewer_id: str, path: str):
-    """Write viewer settings only if something actually changed (prevents disk churn)."""
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     df = _load_viewers_df(path)
     row = {
@@ -107,7 +102,7 @@ def upsert_viewer(settings: dict, viewer_id: str, path: str):
         new.update(row)
         new["created_at"] = old.get("created_at", row["created_at"])
         if _row_hash(new) == _row_hash(old):
-            return  # nothing changed → skip write
+            return
         df.loc[df["viewer_id"] == viewer_id, new.keys()] = list(new.values())
     else:
         df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
@@ -115,23 +110,17 @@ def upsert_viewer(settings: dict, viewer_id: str, path: str):
     df.to_csv(path, index=False)
 
 def load_profiles(path: str) -> pd.DataFrame:
-    """Load static profiles, parse interests to list[str], and enforce required columns."""
     if not os.path.exists(path):
         st.error(f"Profiles file not found at: {path}")
         return pd.DataFrame(columns=PROFILES_COLS)
-    df = pd.read_csv(
-        path,
-        converters={"id": str, "interests": _parse_interests}
-    )
+    df = pd.read_csv(path, converters={"id": str, "interests": _parse_interests})
     missing = [c for c in PROFILES_COLS if c not in df.columns]
     if missing:
         st.error(f"profiles.csv is missing columns: {missing}")
         return pd.DataFrame(columns=PROFILES_COLS)
-    # Ensure types
     df["id"] = df["id"].astype(str)
     if "age" in df: df["age"] = pd.to_numeric(df["age"], errors="coerce").fillna(0).astype(int)
     if "distance_km" in df: df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).astype(int)
-    # Small normalization to avoid NA surprises
     for col in ["region","country","city","about","photo_url"]:
         if col in df.columns:
             df[col] = df[col].fillna("")
@@ -140,7 +129,6 @@ def load_profiles(path: str) -> pd.DataFrame:
     return df[PROFILES_COLS].copy()
 
 def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
-    """Build the universe of interests present in profiles for sidebar selection."""
     s = set()
     if "interests" in df.columns:
         for lst in df["interests"]:
@@ -148,38 +136,23 @@ def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
                 s.update([str(x) for x in lst])
     return sorted(s)
 
-# ---------- robust interactions loader ----------
+# ---------- interactions loader ----------
 def read_interactions_df(path: str) -> pd.DataFrame:
-    """
-    Always return a DataFrame with INTERACTION_FIELDS columns (may be empty).
-    Handles:
-      - missing file
-      - empty file
-      - file without header (header=None) IF column count matches
-      - files with unexpected schema → return empty safe DF
-    """
     if not os.path.exists(path):
         return pd.DataFrame(columns=INTERACTION_FIELDS)
-
-    # Try normal read
     try:
         df = pd.read_csv(path, dtype={"viewer_id": str, "profile_id": str})
-        # If it's empty but has no columns, return empty with schema
         if df.empty and not set(INTERACTION_FIELDS).issubset(set(df.columns)):
             return pd.DataFrame(columns=INTERACTION_FIELDS)
-        # If required columns are missing, try header=None path
         if not set(INTERACTION_FIELDS).issubset(set(df.columns)):
-            # Try to read without header and fix columns if width matches
             df2 = pd.read_csv(path, header=None)
             if df2.shape[1] == len(INTERACTION_FIELDS):
                 df2.columns = INTERACTION_FIELDS
                 return df2
             else:
-                # schema mismatch → safest is empty DF with correct columns
                 return pd.DataFrame(columns=INTERACTION_FIELDS)
         return df
     except Exception:
-        # Try header=None fallback
         try:
             df2 = pd.read_csv(path, header=None)
             if df2.shape[1] == len(INTERACTION_FIELDS):
@@ -190,7 +163,6 @@ def read_interactions_df(path: str) -> pd.DataFrame:
         return pd.DataFrame(columns=INTERACTION_FIELDS)
 
 def hydrate_interactions_for_viewer(viewer_id: str, path: str):
-    """Return dict with likes/passes/superlikes lists for a viewer from interactions.csv."""
     df = read_interactions_df(path)
     if df.empty or "viewer_id" not in df.columns:
         return {"likes": [], "passes": [], "superlikes": []}
@@ -202,15 +174,13 @@ def hydrate_interactions_for_viewer(viewer_id: str, path: str):
     }
 
 # ================================================================
-# Match endpoint helper (calls GET /match/{profile})
+# Call GET /match/{profile} helper (ENSURE GET)
 # ================================================================
-def call_match_endpoint_using_path(profile_id: str, endpoint_template: str) -> dict:
+def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
     """
-    Call the backend using the profile id as a path parameter.
-    endpoint_template may include '{profile}' placeholder.
-    If it doesn't, the function will append '/{profile}'.
-    Performs a GET request (since backend route is @app.get).
-    Returns {'ok': True, 'status_code': int, 'text': str, 'json': parsed_or_None} or {'ok': False, 'error': str}.
+    Calls the backend using GET and the profile id as a path param.
+    endpoint_template may include '{profile}', otherwise '/{profile}' will be appended.
+    Returns dict with details for debug.
     """
     if not endpoint_template:
         return {"ok": False, "error": "no endpoint template configured"}
@@ -220,29 +190,25 @@ def call_match_endpoint_using_path(profile_id: str, endpoint_template: str) -> d
         else:
             base = endpoint_template.rstrip("/") + "/"
             url = urljoin(base, str(profile_id).lstrip("/"))
+        # MUST use GET for @app.get("/match/{profile}")
         resp = requests.get(url, timeout=6.0)
         try:
             parsed = resp.json()
         except Exception:
             parsed = None
-        return {"ok": True, "status_code": resp.status_code, "text": resp.text, "json": parsed, "url": url}
+        return {"ok": True, "method": "GET", "url": url, "status_code": resp.status_code, "text": resp.text, "json": parsed}
     except Exception as exc:
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
-# Interaction logging (CSV + path-based GET to /match/{profile})
+# Interaction logging — write CSV AND call GET /match/{profile}
 # ================================================================
 def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
     """
-    Persist interaction to CSV (as before) and then call GET on configured match endpoint:
-      - If sidebar value is 'http://host:port/match/{profile}', it will call that formatted URL.
-      - If it's 'http://host:port/match' it will call 'http://host:port/match/<profile>'.
-    The result is saved to st.session_state['last_webhook_result'] for debug.
+    Persist to CSV and then call GET /match/{profile_id} synchronously.
+    Writes the debug result to st.session_state['last_match_call'].
     """
-    path = st.session_state.get(
-        "interactions_csv",
-        "./interactions.csv"
-    )
+    path = st.session_state.get("interactions_csv", "./interactions.csv")
     exists = os.path.exists(path)
     row = {
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -263,16 +229,16 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
     except Exception as e:
         st.session_state["last_csv_error"] = str(e)
 
-    # Now call the match endpoint (GET /match/{profile}) synchronously
+    # Call the match endpoint using GET and path param construction
     match_template = st.session_state.get("interactions_webhook", "").strip()
     if match_template:
-        result = call_match_endpoint_using_path(str(profile_row["id"]), match_template)
-        st.session_state["last_webhook_result"] = result
+        result = call_match_endpoint_get(str(profile_row["id"]), match_template)
+        st.session_state["last_match_call"] = result
     else:
-        st.session_state["last_webhook_result"] = {"ok": False, "error": "no match endpoint configured"}
+        st.session_state["last_match_call"] = {"ok": False, "error": "no match endpoint configured"}
 
 # ================================================================
-# Lightweight caching (no DF hashing)
+# Lightweight caching + helpers (unchanged)
 # ================================================================
 @st.cache_data(show_spinner=False)
 def _file_mtime(path: str):
@@ -283,7 +249,6 @@ def _file_mtime(path: str):
 
 @st.cache_data(show_spinner=True)
 def load_profiles_cached(path: str, mtime) -> pd.DataFrame:
-    # mtime acts as a cache key so edits on disk invalidate the cache
     return load_profiles(path)
 
 def health_banner():
@@ -298,11 +263,9 @@ def health_banner():
     )
 
 # ================================================================
-# Session state
+# Session state bootstrapping (unchanged except default template)
 # ================================================================
 def ensure_state():
-    """Bootstrap session state and auto-login to a specific profile (default: ssse1024)."""
-    # -------- fixed paths --------
     if "interactions_csv" not in st.session_state:
         st.session_state.interactions_csv = "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/interactions.csv"
     if "viewers_csv" not in st.session_state:
@@ -310,16 +273,13 @@ def ensure_state():
     if "profiles_csv" not in st.session_state:
         st.session_state.profiles_csv = "/Users/sudhirsingh/PyCharmProjects/story/src/services/frontend/data/profiles.csv"
 
-    # -------- load static profiles (cached by mtime) --------
     if "profiles_df" not in st.session_state:
         mt = _file_mtime(st.session_state.profiles_csv)
         st.session_state.profiles_df = load_profiles_cached(st.session_state.profiles_csv, mt)
 
-    # -------- per-viewer container --------
     if "users" not in st.session_state:
         st.session_state.users = {}
 
-    # Provide a minimal default viewer (used only if target ID not found)
     if "active_user" not in st.session_state:
         st.session_state.users["Default"] = {
             "settings": {
@@ -334,91 +294,39 @@ def ensure_state():
         }
         st.session_state.active_user = "Default"
 
-    # default match endpoint template (can include {profile})
+    # default template uses {profile} placeholder (recommended)
     if "interactions_webhook" not in st.session_state:
         st.session_state.interactions_webhook = "http://127.0.0.1:8000/match/{profile}"
 
-    # -------- attempt to auto-login to your specific profile --------
-    try:
-        TARGET_ID = os.environ.get("DEFAULT_VIEWER_ID", "ssse1024")
-        df = st.session_state.profiles_df
-        if not df.empty:
-            target_row = df.loc[df["id"].astype(str) == str(TARGET_ID)]
-            if not target_row.empty:
-                r = target_row.iloc[0]
-                vname = f"{r['name']}-{r['id']}"
-
-                # create viewer state once
-                if vname not in st.session_state.users:
-                    st.session_state.users[vname] = {
-                        "settings": {
-                            "name": r["name"],
-                            "age": int(r["age"]),
-                            "city": r.get("city", ""),
-                            "seeking": ["Woman","Man","Non-binary"],
-                            "age_min": max(18, int(r["age"]) - 5),
-                            "age_max": min(80, int(r["age"]) + 5),
-                            "top_interests": list(r.get("interests", [])[:3]) if isinstance(r.get("interests", []), list) else [],
-                            "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
-                        },
-                        "likes": [], "passes": [], "superlikes": [],
-                        "current_index": 0,
-                    }
-                    # persist viewer + hydrate any past interactions
-                    upsert_viewer(st.session_state.users[vname]["settings"], viewer_id=vname, path=st.session_state.viewers_csv)
-                    hist = hydrate_interactions_for_viewer(vname, st.session_state.interactions_csv)
-                    st.session_state.users[vname]["likes"] = sorted(set(hist.get("likes", [])))
-                    st.session_state.users[vname]["passes"] = sorted(set(hist.get("passes", [])))
-                    st.session_state.users[vname]["superlikes"] = sorted(set(hist.get("superlikes", [])))
-
-                # make this the active user
-                st.session_state.active_user = vname
-    except Exception:
-        # If anything goes sideways (missing CSV, columns, etc.), we silently keep "Default"
-        pass
-
-    # -------- ranking cache & UI state --------
     if "ranked_cache" not in st.session_state:
         st.session_state.ranked_cache = {}
     if "grid_page" not in st.session_state:
         st.session_state.grid_page = 1
     if "grid_page_size" not in st.session_state:
-        # uses your existing constant; change default if you want
         st.session_state.grid_page_size = GRID_PAGE_SIZE_DEFAULT
     if "low_bandwidth" not in st.session_state:
         st.session_state.low_bandwidth = True
 
-    # keep last webhook result for debug
-    if "last_webhook_result" not in st.session_state:
-        st.session_state["last_webhook_result"] = {"ok": False, "error": "no calls yet"}
+    if "last_match_call" not in st.session_state:
+        st.session_state["last_match_call"] = {"ok": False, "error": "no calls yet"}
 
-    # -------- final: merge-on-every-run to keep counters in sync with disk --------
     rehydrate_current_viewer_merge()
 
 def get_active():
     return st.session_state.users[st.session_state.active_user]
 
-# ================================================================
-# Hydration helpers
-# ================================================================
+# Hydration helpers (unchanged)
 def rehydrate_current_viewer_merge():
-    """
-    Read likes/passes/superlikes for the active viewer from interactions.csv every run
-    and MERGE with in-memory lists so counters increment immediately and persist after restart.
-    """
     vid = st.session_state.active_user
     u = st.session_state.users.get(vid)
     if not u:
         return
     disk = hydrate_interactions_for_viewer(vid, st.session_state.interactions_csv)
-    # merge (union) with current session state
     u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
     u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
     u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
 
-# ================================================================
 # Login-as helper
-# ================================================================
 def switch_to_profile_as_viewer(profile_row: pd.Series):
     vname = f"{profile_row['name']}-{profile_row['id']}"
     st.session_state.users.setdefault(vname, {
@@ -437,14 +345,10 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
     })
     upsert_viewer(st.session_state.users[vname]["settings"], viewer_id=vname, path=st.session_state.viewers_csv)
     st.session_state.active_user = vname
-    # merge with disk history immediately so counters reflect past data as soon as you switch
     rehydrate_current_viewer_merge()
-    # reset grid paging
     st.session_state.grid_page = 1
 
-# ================================================================
-# Vectorized matching + fast caching
-# ================================================================
+# Scoring and ranking functions unchanged...
 def _age_score_vector(age_series: pd.Series, amin: int, amax: int) -> pd.Series:
     mid = (amin + amax) / 2.0
     spread = max((amax - amin) / 2.0, 1.0)
@@ -468,7 +372,6 @@ def _interest_overlap_vector(interests_col: pd.Series, your_top: set) -> pd.Seri
     return pd.Series(vals, index=interests_col.index)
 
 def _settings_fingerprint(settings: dict) -> str:
-    """Stable, tiny fingerprint of settings for caching."""
     payload = {
         "age_min": settings["age_min"],
         "age_max": settings["age_max"],
@@ -483,7 +386,6 @@ def _settings_fingerprint(settings: dict) -> str:
     return _row_hash(payload)
 
 def _profiles_fingerprint(df: pd.DataFrame) -> str:
-    """Small fingerprint of the base data without hashing list columns."""
     if df.empty:
         return "empty"
     cols = ["id","age","gender","city","country","distance_km"]
@@ -495,10 +397,8 @@ def _profiles_fingerprint(df: pd.DataFrame) -> str:
     return md5.hexdigest()
 
 def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, sort_by: str, viewer_id: str) -> pd.DataFrame:
-    """Rank with a session-level cache keyed by small fingerprints (no DF hashing)."""
     if raw_df.empty:
         return raw_df.copy()
-
     key = (
         _profiles_fingerprint(raw_df),
         _settings_fingerprint(settings),
@@ -508,39 +408,28 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, sort_by: str, view
     cache = st.session_state.ranked_cache
     if key in cache:
         return cache[key]
-
     df = raw_df.copy()
-
-    # filter first
     mask = df["gender"].isin(settings["seeking"]) & df["age"].between(settings["age_min"], settings["age_max"])
     filtered = df[mask].copy()
     if filtered.empty:
         filtered = df.copy()
-
-    # vectorized scoring
     w = settings["weights"]
     age_s = _age_score_vector(filtered["age"], settings["age_min"], settings["age_max"])
     dist_s = _distance_score_vector(filtered["distance_km"])
     your_set = set(settings.get("top_interests", []) or [])
     int_s = _interest_overlap_vector(filtered["interests"], your_set)
-
     filtered["compatibility"] = (w["age"] * age_s + w["distance"] * dist_s + w["interests"] * int_s).round(3)
-
-    # sort
     if sort_by == "Best match":
         filtered = filtered.sort_values(by=["compatibility", "distance_km"], ascending=[False, True])
     elif sort_by == "Nearest":
         filtered = filtered.sort_values(by=["distance_km", "compatibility"], ascending=[True, False])
-    else:  # Shuffle
+    else:
         filtered = filtered.sample(frac=1, random_state=42)
-
     out = filtered.reset_index(drop=True)
     cache[key] = out
     return out
 
-# ================================================================
-# UI helpers
-# ================================================================
+# UI helpers (unchanged except debug reporting)
 def profile_card(row, show_image=True):
     with st.container(border=True):
         c1, c2 = st.columns([1, 2], gap="large")
@@ -560,13 +449,6 @@ def profile_card(row, show_image=True):
                 st.write("**Interests**:", "")
 
 def action_bar(row, user_state):
-    """
-    When a button is clicked we:
-      - update the in-memory lists
-      - persist via log_interaction (writes CSV + GET /match/{profile})
-      - advance current_index and rehydrate merge
-      - rerun so next profile appears
-    """
     c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
         if st.button("👎 Pass", key=f"pass_{row['id']}"):
@@ -620,7 +502,7 @@ def export_buttons(df, viewer_name, user_state):
     )
 
 # ================================================================
-# App
+# App entry
 # ================================================================
 ensure_state()
 
@@ -628,7 +510,7 @@ st.title("Recommendation")
 st.caption("Pick any profile — you instantly 'log in' as them. Interactions log to CSV and call GET /match/{profile}.")
 health_banner()
 
-# --- Viewer (single control: login as ANY profile) ---
+# Viewer selection UI (unchanged)
 with st.container(border=True):
     st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
@@ -641,12 +523,10 @@ with st.container(border=True):
         ]
         default_ix = st.session_state.get("pick_profile_ix", 0)
         default_ix = min(default_ix, len(labels) - 1)
-
         def _on_pick_profile_as_viewer():
             ix = st.session_state["pick_profile_ix"]
             pr = df_choices.iloc[ix]
             switch_to_profile_as_viewer(pr)
-
         st.selectbox(
             "Pick profile to log in as",
             options=list(range(len(labels))),
@@ -656,18 +536,14 @@ with st.container(border=True):
             on_change=_on_pick_profile_as_viewer,
         )
 
-# --- Sidebar: settings + webhook template ---
+# Sidebar with template input & settings
 with st.sidebar:
     st.header("Viewer Settings")
     ustate = get_active()
     s = ustate["settings"]
-
-    # interests universe derived from profiles file
     generator_interests = compute_all_interests_from_profiles(st.session_state.profiles_df)
-
     dataset_cities = sorted(st.session_state.profiles_df["city"].dropna().unique().tolist()) if not st.session_state.profiles_df.empty else []
     default_city = s.get("city") if s.get("city") in dataset_cities else (dataset_cities[0] if dataset_cities else "Mumbai")
-
     s["name"] = st.text_input("Your name", s["name"])
     s["age"] = st.number_input("Your age", min_value=18, max_value=80, value=int(s["age"]), step=1)
     s["city"] = st.selectbox("Your city", dataset_cities or ["Mumbai"], index=(dataset_cities.index(default_city) if dataset_cities and default_city in dataset_cities else 0))
@@ -677,33 +553,26 @@ with st.sidebar:
         s["age_min"] = st.number_input("Min age", 18, 80, int(s["age_min"]), step=1)
     with c2:
         s["age_max"] = st.number_input("Max age", 18, 80, int(s["age_max"]), step=1)
-
     st.markdown("**Top interests** (helps ranking)")
     default_interest_seed = [i for i in s.get("top_interests", []) if i in generator_interests][:5]
     fallback = generator_interests[:3] if generator_interests else []
     s["top_interests"] = st.multiselect("Pick up to 5", generator_interests, default=(default_interest_seed or fallback), max_selections=5)
-
     st.markdown("**Scoring weights**")
     age_w = st.slider("Age fit", 0.0, 1.0, float(s["weights"]["age"]), 0.05)
     dist_w = st.slider("Distance", 0.0, 1.0, float(s["weights"]["distance"]), 0.05)
     int_w = st.slider("Interests overlap", 0.0, 1.0, float(s["weights"]["interests"]), 0.05)
     total = age_w + dist_w + int_w or 1.0
     s["weights"] = {"age": age_w/total, "distance": dist_w/total, "interests": int_w/total}
-
-    # persist viewer after any changes (write only if changed)
     upsert_viewer(s, viewer_id=st.session_state.active_user, path=st.session_state.viewers_csv)
 
     st.divider()
     st.subheader("Profiles")
     st.caption("Profiles are loaded from the static CSV below.")
     st.text_input("Profiles CSV path", key="profiles_csv", value=st.session_state.get("profiles_csv", ""))
-
     if st.button("🔄 Reload profiles from CSV"):
         mt = _file_mtime(st.session_state.profiles_csv)
         st.session_state.profiles_df = load_profiles_cached(st.session_state.profiles_csv, mt)
-        # blow the ranking cache because base data changed
         st.session_state.ranked_cache.clear()
-        # reset per-viewer indices since ranking may change
         for uname in st.session_state.users:
             st.session_state.users[uname]["current_index"] = 0
         st.success(f"Loaded {len(st.session_state.profiles_df)} profiles from {st.session_state.profiles_csv}")
@@ -744,7 +613,7 @@ with st.sidebar:
     if st.button("👀 Show saved viewers.csv"):
         st.dataframe(_load_viewers_df(st.session_state.viewers_csv), width='stretch')
 
-# Ranking & stats (cached via fingerprints)
+# Ranking & UI (unchanged)
 sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
 df_ranked = get_ranked_profiles(st.session_state.profiles_df, get_active()["settings"], sort_by, st.session_state.active_user)
 
@@ -771,7 +640,6 @@ with tabs[1]:
     if df_ranked.empty:
         st.info("No profiles to show. Reload your profiles CSV or relax filters.")
     else:
-        # Pagination controls
         total = len(df_ranked)
         per_page = int(st.session_state.grid_page_size)
         total_pages = max((total + per_page - 1) // per_page, 1)
@@ -786,11 +654,9 @@ with tabs[1]:
             if st.button("Next ➡️", disabled=(st.session_state.grid_page >= total_pages)):
                 st.session_state.grid_page = min(total_pages, st.session_state.grid_page + 1)
                 st.rerun()
-
         start = (st.session_state.grid_page - 1) * per_page
         end = min(start + per_page, total)
         page_df = df_ranked.iloc[start:end]
-
         n_cols = 3
         rows = [page_df.iloc[i:i+n_cols] for i in range(0, len(page_df), n_cols)]
         for chunk in rows:
@@ -826,23 +692,15 @@ with tabs[1]:
 with tabs[2]:
     st.subheader("Your Decisions")
     ustate = get_active()
-    base_df = st.session_state.profiles_df  # use the full dataset so history is visible regardless of filters
+    base_df = st.session_state.profiles_df
     liked_ids = set(ustate["likes"] + ustate["superlikes"])
     passed_ids = set(ustate["passes"])
-
     liked_df = base_df[base_df["id"].isin(liked_ids)].copy()
     passed_df = base_df[base_df["id"].isin(passed_ids)].copy()
-
-    # Optionally compute compatibility for display (not required for showing)
     if not liked_df.empty:
-        liked_df = liked_df.merge(
-            df_ranked[["id","compatibility"]], on="id", how="left"
-        )
+        liked_df = liked_df.merge(df_ranked[["id","compatibility"]], on="id", how="left")
     if not passed_df.empty:
-        passed_df = passed_df.merge(
-            df_ranked[["id","compatibility"]], on="id", how="left"
-        )
-
+        passed_df = passed_df.merge(df_ranked[["id","compatibility"]], on="id", how="left")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### ❤️ Likes & ⭐ Superlikes")
@@ -864,7 +722,6 @@ with tabs[2]:
                 comp_txt = f" — Compat {comp:.2f}" if pd.notna(comp) else ""
                 st.write(f"**{r['name']}**, {r['age']} • {r['gender']}{comp_txt}")
                 st.caption(f"📍 {r['city']} • ~{r['distance_km']} km")
-
     st.divider()
     export_buttons(base_df, st.session_state.active_user, ustate)
 
@@ -874,36 +731,28 @@ with tabs[3]:
     st.json(get_active()["settings"])
     st.write("**Current dataset (ranked for this viewer) — showing first 200 rows**")
     st.dataframe(df_ranked.head(200), width='stretch')
-
     st.markdown("**Recent interactions (active viewer)**")
     interactions_df = read_interactions_df(st.session_state.interactions_csv)
     if interactions_df.empty:
         st.caption("No interactions file or it's empty.")
     else:
-        st.dataframe(
-            interactions_df[interactions_df["viewer_id"].astype(str) == str(st.session_state.active_user)]
-            .sort_values("timestamp", ascending=False)
-            .head(25),
-            width='stretch'
-        )
+        st.dataframe(interactions_df[interactions_df["viewer_id"].astype(str) == str(st.session_state.active_user)].sort_values("timestamp", ascending=False).head(25), width='stretch')
 
     st.divider()
     st.markdown("### Last match endpoint call result")
-    st.caption("Shows the last GET /match/{profile} call result (status, body or error).")
-    st.json(st.session_state.get("last_webhook_result", {"ok": False, "error": "no calls yet"}))
+    st.caption("Shows the last GET /match/{profile} call result (method/url/status/text/json or error).")
+    st.json(st.session_state.get("last_match_call", {"ok": False, "error": "no calls yet"}))
 
     st.divider()
     st.markdown("**Maintenance**")
     if st.button("Repair interactions.csv header (if needed)"):
         df0 = read_interactions_df(st.session_state.interactions_csv)
-        # If it's empty we just ensure header exists by rewriting an empty file with header
         if df0.empty:
             with open(st.session_state.interactions_csv, "w", newline="", encoding="utf-8") as f:
                 writer = csv.DictWriter(f, fieldnames=INTERACTION_FIELDS)
                 writer.writeheader()
             st.success("Rewrote empty interactions.csv with correct header.")
         else:
-            # Ensure column order & presence; rewrite
             df_fixed = df0.copy()
             for col in INTERACTION_FIELDS:
                 if col not in df_fixed.columns:
