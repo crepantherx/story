@@ -260,8 +260,9 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
 
     # Call the match endpoint using GET and path param construction
     match_template = st.session_state.get("interactions_webhook", "").strip()
+    k = viewer_key.split("-")[-1]
     if match_template:
-        result = call_match_endpoint_get(str(profile_row["id"]), match_template)
+        result = call_match_endpoint_get(str(k), match_template)
         st.session_state["last_match_call"] = result
     else:
         st.session_state["last_match_call"] = {"ok": False, "error": "no match endpoint configured"}
