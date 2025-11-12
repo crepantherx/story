@@ -54,7 +54,7 @@ def home():
     return {"status": "ok"}
 
 @app.get("/match/{profile}")
-def abc(profile: str):
+def match(profile: str):
 
     def top_n_similar(annoy_index, id_map, query_id, n=5, seen_ids=None):
         query_idx = [k for k, v in id_map.items() if v == query_id][0]
