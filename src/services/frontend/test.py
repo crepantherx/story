@@ -208,16 +208,19 @@ def call_update_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
     Calls the backend using GET and the profile id as a path param for /update/{profile}.
     Returns dict with details for debug.
     """
+    profile_id = profile_id.split("-")[-1]
     if not endpoint_template:
         return {"ok": False, "error": "no update endpoint template configured"}
     try:
         if "{profile}" in endpoint_template:
             url = endpoint_template.format(profile=profile_id)
+
         else:
             base = endpoint_template.rstrip("/") + "/"
             url = urljoin(base, str(profile_id).lstrip("/"))
         # MUST use GET for @app.get("/update/{profile}")
-        resp = requests.get(url, timeout=6.0)
+        print(url)
+        resp = requests.get(url, timeout=10.0)
         try:
             parsed = resp.json()
         except Exception:
