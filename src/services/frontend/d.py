@@ -1,11 +1,13 @@
-# app.py — Streamlit app (endpoint-driven) (fixed: no OPTIONS, correct upsert payload shape)
+# app.py — Streamlit app (endpoint-driven) — full fixed version
 # Run with: API_BASE=http://127.0.0.1:8000 streamlit run app.py
 
 import os
 import json
 import hashlib
+import traceback
 from datetime import datetime, timezone
 from urllib.parse import urljoin
+from typing import Any
 
 import pandas as pd
 import streamlit as st
@@ -23,14 +25,13 @@ st.set_page_config(
     layout="wide",
 )
 
-# Required environment runtime config
-API_BASE = "http://127.0.0.1:8000"
+API_BASE = "http://0.0.0.0:8000"
 if not API_BASE:
     st.error("API_BASE environment variable is required and must point to your backend (e.g. http://127.0.0.1:8000).")
     st.stop()
 
 # ================================================================
-# Constants & fields
+# Fields and column constants
 # ================================================================
 VIEWER_COLS = [
     "viewer_id","name","age","city",
@@ -52,9 +53,6 @@ INTERACTION_FIELDS = [
 # ================================================================
 # Small helpers
 # ================================================================
-def _as_json(value):
-    return json.dumps(value, ensure_ascii=False)
-
 def _parse_interests(val):
     if isinstance(val, list):
         return val
@@ -72,73 +70,118 @@ def _parse_interests(val):
         return [p.strip() for p in s.split(",") if p.strip()]
     return []
 
+def _ensure_list(x):
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    try:
+        parsed = json.loads(x)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    if isinstance(x, str) and "," in x:
+        return [p.strip() for p in x.split(",") if p.strip()]
+    return [x]
+
+def _safe_int(v, default=None):
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _safe_float(v, default=None):
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 def _row_hash(d: dict) -> str:
     return hashlib.md5(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest()
 
+# Streamlit versions differ; safe rerun tries experimental_rerun then falls back
+def safe_rerun():
+    try:
+        st.experimental_rerun()
+    except Exception:
+        # force small session change so page refreshes
+        st.session_state["_rerun_count"] = st.session_state.get("_rerun_count", 0) + 1
+        return
+
 def get_active():
-    """Return the active user object from session state."""
     return st.session_state.users[st.session_state.active_user]
 
 # ================================================================
-# Server-backed viewers: upsert via API (fixed payload shape)
+# API helpers — upsert viewer, add interaction, fetch history
 # ================================================================
 def upsert_viewer_via_api(settings: dict, viewer_id: str) -> dict:
     """
     Calls POST {API_BASE}/upsert_viewer to upsert one viewer.
+    Defensive about types to avoid 422 errors from backend.
     Maps settings['weights'] -> w_age, w_distance, w_interests.
-    Only include fields present in settings to avoid overwriting.
     """
     url = urljoin(API_BASE.rstrip("/") + "/", "upsert_viewer")
     payload = {"viewer_id": viewer_id}
-    # Fields that the backend expects (viewer model)
-    payload_fields = [
-        "name", "age", "city", "seeking", "age_min", "age_max",
-        "top_interests", "w_age", "w_distance", "w_interests"
-    ]
 
-    # Map simple fields
-    for f in ["name", "age", "city", "seeking", "age_min", "age_max", "top_interests"]:
-        val = settings.get(f)
+    # text fields
+    for key in ("name", "city"):
+        val = settings.get(key)
         if val is not None:
-            payload[f] = val
+            payload[key] = val
 
-    # Map weights -> w_age, w_distance, w_interests
+    # ints
+    age = _safe_int(settings.get("age"))
+    if age is not None:
+        payload["age"] = age
+    age_min = _safe_int(settings.get("age_min"))
+    if age_min is not None:
+        payload["age_min"] = age_min
+    age_max = _safe_int(settings.get("age_max"))
+    if age_max is not None:
+        payload["age_max"] = age_max
+
+    # lists
+    seeking = _ensure_list(settings.get("seeking"))
+    if seeking is not None:
+        payload["seeking"] = seeking
+    top_interests = _ensure_list(settings.get("top_interests"))
+    if top_interests is not None:
+        payload["top_interests"] = top_interests
+
+    # weights -> explicit numeric fields
     w = settings.get("weights") or {}
     if "age" in w:
-        payload["w_age"] = float(w["age"])
+        payload["w_age"] = _safe_float(w.get("age"), 0.0)
     if "distance" in w:
-        payload["w_distance"] = float(w["distance"])
+        payload["w_distance"] = _safe_float(w.get("distance"), 0.0)
     if "interests" in w:
-        payload["w_interests"] = float(w["interests"])
+        payload["w_interests"] = _safe_float(w.get("interests"), 0.0)
 
-    # Send request
+    # send request
     try:
         r = requests.post(url, json=payload, timeout=10.0)
     except Exception as e:
         raise RuntimeError(f"Failed to call upsert endpoint: {e}")
 
-    # Surface backend errors (422, 400, 500) clearly to the caller
+    # surface backend errors clearly
     if r.status_code >= 400:
-        # Try to parse JSON error, otherwise return text
         try:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Upsert failed ({r.status_code}): {err}")
+        raise RuntimeError(f"Upsert failed ({r.status_code}): {err}\nPayload: {json.dumps(payload, default=str)}")
 
     try:
         return r.json()
     except Exception:
         return {"status": "success", "raw": r.text}
 
-# ================================================================
-# Server-backed interactions: append via API
-# ================================================================
 def add_interaction_via_api(row: dict) -> dict:
-    """
-    Calls POST {API_BASE}/add_interaction to append a single interaction row.
-    Expects row dict with keys matching INTERACTION_FIELDS (timestamp optional).
-    """
     url = urljoin(API_BASE.rstrip("/") + "/", "add_interaction")
     try:
         r = requests.post(url, json=row, timeout=6.0)
@@ -150,20 +193,14 @@ def add_interaction_via_api(row: dict) -> dict:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Add interaction failed ({r.status_code}): {err}")
+        raise RuntimeError(f"Add interaction failed ({r.status_code}): {err}\nPayload: {json.dumps(row, default=str)}")
 
     try:
         return r.json()
     except Exception:
         return {"status": "success", "raw": r.text}
 
-# ================================================================
-# Remote history: get interactions for viewer from backend
-# ================================================================
 def hydrate_interactions_for_viewer_remote(viewer_id: str):
-    """
-    Calls backend GET /get_interactions/{viewer_id} and returns {likes, passes, superlikes}.
-    """
     url = urljoin(API_BASE.rstrip("/") + "/", f"get_interactions/{viewer_id}")
     try:
         r = requests.get(url, timeout=6.0)
@@ -182,23 +219,17 @@ def hydrate_interactions_for_viewer_remote(viewer_id: str):
     except Exception as e:
         raise RuntimeError(f"Failed to parse get_interactions response: {e}")
 
-    likes = [r["profile_id"] for r in rows if r.get("action") == "like"]
-    passes = [r["profile_id"] for r in rows if r.get("action") == "pass"]
-    superlikes = [r["profile_id"] for r in rows if r.get("action") == "superlike"]
+    likes = [rr["profile_id"] for rr in rows if rr.get("action") == "like"]
+    passes = [rr["profile_id"] for rr in rows if rr.get("action") == "pass"]
+    superlikes = [rr["profile_id"] for rr in rows if rr.get("action") == "superlike"]
     return {"likes": likes, "passes": passes, "superlikes": superlikes}
 
-# ================================================================
-# Fetch viewer row from backend
-# ================================================================
 def fetch_viewer_row(viewer_id: str) -> dict:
-    """
-    Calls backend GET /get_viewer/{viewer_id} and returns the viewer object or None.
-    """
     url = urljoin(API_BASE.rstrip("/") + "/", f"get_viewer/{viewer_id}")
     try:
         r = requests.get(url, timeout=6.0)
     except Exception as e:
-        raise RuntimeError(f"Failed to call backend get_viewer: {e}")
+        raise RuntimeError(f"Failed to call get_viewer: {e}")
 
     if r.status_code == 404:
         return None
@@ -207,7 +238,7 @@ def fetch_viewer_row(viewer_id: str) -> dict:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Backend get_viewer error ({r.status_code}): {err}")
+        raise RuntimeError(f"get_viewer failed ({r.status_code}): {err}")
 
     try:
         return r.json()
@@ -215,13 +246,9 @@ def fetch_viewer_row(viewer_id: str) -> dict:
         raise RuntimeError(f"Failed to parse get_viewer response: {e}")
 
 # ================================================================
-# Call GET /match/{profile} helper
+# Match endpoint helper
 # ================================================================
 def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
-    """
-    Calls match endpoint using GET and profile id as path param.
-    Returns dict with method/url/status/text/json or error.
-    """
     if not endpoint_template:
         return {"ok": False, "error": "no endpoint template configured"}
     try:
@@ -240,13 +267,9 @@ def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
-# Interaction logging — calls API and match endpoint
+# Interaction logging / UI flow
 # ================================================================
 def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
-    """
-    Build interaction row and POST to /add_interaction. Then call /match/{profile}.
-    Stores last_match_call and last_add_interaction in session state for Debug tab.
-    """
     ts = datetime.now(timezone.utc).isoformat()
     row = {
         "timestamp": ts,
@@ -258,7 +281,6 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
         "compatibility": float(compatibility) if compatibility is not None else None,
     }
 
-    # Send to backend
     try:
         add_res = add_interaction_via_api(row)
         st.session_state["last_add_interaction"] = {"ok": True, "response": add_res}
@@ -267,7 +289,6 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
         st.error(f"Failed to add interaction: {e}")
         return
 
-    # Call the match endpoint
     match_template = st.session_state.get("interactions_webhook", "").strip()
     if match_template:
         result = call_match_endpoint_get(str(profile_row["id"]), match_template)
@@ -276,7 +297,7 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
         st.session_state["last_match_call"] = {"ok": False, "error": "no match endpoint configured"}
 
 # ================================================================
-# Caching helpers for profiles (local CSV)
+# Profiles CSV loader (local)
 # ================================================================
 @st.cache_data(show_spinner=False)
 def _file_mtime(path: str):
@@ -289,9 +310,6 @@ def _file_mtime(path: str):
 def load_profiles_cached(path: str, mtime) -> pd.DataFrame:
     return load_profiles(path)
 
-# ================================================================
-# Local profiles loader (unchanged)
-# ================================================================
 def load_profiles(path: str) -> pd.DataFrame:
     if not os.path.exists(path):
         st.error(f"Profiles file not found at: {path}")
@@ -299,11 +317,13 @@ def load_profiles(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, converters={"id": str, "interests": _parse_interests})
     missing = [c for c in PROFILES_COLS if c not in df.columns]
     if missing:
-        st.error(f"profiles.csv is missing columns: {missing}")
+        st.error(f"profiles.csv missing columns: {missing}")
         return pd.DataFrame(columns=PROFILES_COLS)
     df["id"] = df["id"].astype(str)
-    if "age" in df: df["age"] = pd.to_numeric(df["age"], errors="coerce").fillna(0).astype(int)
-    if "distance_km" in df: df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).astype(int)
+    if "age" in df:
+        df["age"] = pd.to_numeric(df["age"], errors="coerce").fillna(0).astype(int)
+    if "distance_km" in df:
+        df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).astype(int)
     for col in ["region","country","city","about","photo_url"]:
         if col in df.columns:
             df[col] = df[col].fillna("")
@@ -320,15 +340,17 @@ def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
     return sorted(s)
 
 # ================================================================
-# Application state bootstrapping (modified to use backend)
+# Application state bootstrapping (wrapped with debug catcher)
 # ================================================================
 def ensure_state():
+    # default CSV path and load local profiles
     if "profiles_csv" not in st.session_state:
-        st.session_state.profiles_csv = "./profiles.csv"  # still local
+        st.session_state.profiles_csv = "./profiles.csv"
     if "profiles_df" not in st.session_state:
         mt = _file_mtime(st.session_state.profiles_csv)
         st.session_state.profiles_df = load_profiles_cached(st.session_state.profiles_csv, mt)
 
+    # user state
     if "users" not in st.session_state:
         st.session_state.users = {}
     if "active_user" not in st.session_state:
@@ -348,42 +370,53 @@ def ensure_state():
     if "interactions_webhook" not in st.session_state:
         st.session_state.interactions_webhook = API_BASE.rstrip("/") + "/match/{profile}"
 
-    if "ranked_cache" not in st.session_state:
-        st.session_state.ranked_cache = {}
-    if "grid_page" not in st.session_state:
-        st.session_state.grid_page = 1
-    if "grid_page_size" not in st.session_state:
-        st.session_state.grid_page_size = GRID_PAGE_SIZE_DEFAULT
-    if "low_bandwidth" not in st.session_state:
-        st.session_state.low_bandwidth = True
+    st.session_state.setdefault("ranked_cache", {})
+    st.session_state.setdefault("grid_page", 1)
+    st.session_state.setdefault("grid_page_size", GRID_PAGE_SIZE_DEFAULT)
+    st.session_state.setdefault("low_bandwidth", True)
+    st.session_state.setdefault("last_match_call", {"ok": False, "error": "no calls yet"})
+    st.session_state.setdefault("last_add_interaction", {"ok": False, "error": "no calls yet"})
 
-    if "last_match_call" not in st.session_state:
-        st.session_state["last_match_call"] = {"ok": False, "error": "no calls yet"}
-    if "last_add_interaction" not in st.session_state:
-        st.session_state["last_add_interaction"] = {"ok": False, "error": "no calls yet"}
+    # Ensure default active user exists server-side (upsert). If backend returns 422 or other,
+    # raise exception so debug wrapper can show full error.
+    upsert_viewer_via_api(st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
 
-    # Ensure default active user exists server-side (upsert)
-    try:
-        upsert_viewer_via_api(st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
-    except Exception as e:
-        st.error(f"Failed to upsert default viewer on startup: {e}")
-        st.stop()
+    # Hydrate interactions from backend for active user
+    disk = hydrate_interactions_for_viewer_remote(st.session_state.active_user)
+    u = st.session_state.users.get(st.session_state.active_user)
+    u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
+    u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
+    u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
 
-    # Hydrate interactions for active user from backend
-    try:
-        disk = hydrate_interactions_for_viewer_remote(st.session_state.active_user)
-        u = st.session_state.users.get(st.session_state.active_user)
-        u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
-        u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
-        u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
-    except Exception as e:
-        st.error(f"Failed to load interaction history: {e}")
-        st.stop()
-
-ensure_state()
+# ================= DEBUG WRAPPER for ensure_state =================
+try:
+    ensure_state()
+except Exception as e:
+    st.error("Startup error in ensure_state() — showing details below.")
+    st.markdown("**Exception:**")
+    st.code(f"{type(e).__name__}: {e}")
+    st.markdown("**Traceback:**")
+    st.code(traceback.format_exc())
+    st.markdown("**Runtime diagnostics**")
+    st.write({"API_BASE": API_BASE})
+    st.write("Profiles CSV path (session_state):", st.session_state.get("profiles_csv"))
+    p = st.session_state.get("profiles_csv")
+    if p:
+        try:
+            st.write("profiles.csv exists:", os.path.exists(p))
+            if os.path.exists(p):
+                st.write("profiles.csv first 10 lines:")
+                with open(p, "r", encoding="utf-8") as fh:
+                    for i, ln in enumerate(fh):
+                        st.write(ln.rstrip())
+                        if i >= 9:
+                            break
+        except Exception as ex:
+            st.write("Failed to read profiles.csv:", ex)
+    st.stop()
 
 # ================================================================
-# Scoring & ranking functions (unchanged)
+# Ranking & scoring functions (unchanged)
 # ================================================================
 def _age_score_vector(age_series: pd.Series, amin: int, amax: int) -> pd.Series:
     mid = (amin + amax) / 2.0
@@ -401,10 +434,7 @@ def _interest_overlap_vector(interests_col: pd.Series, your_top: set) -> pd.Seri
     if not your_top:
         return pd.Series(0.0, index=interests_col.index)
     denom = float(len(your_top))
-    vals = [
-        (len(your_top.intersection(set(v if isinstance(v, list) else []))) / denom)
-        for v in interests_col
-    ]
+    vals = [(len(your_top.intersection(set(v if isinstance(v, list) else []))) / denom) for v in interests_col]
     return pd.Series(vals, index=interests_col.index)
 
 def _settings_fingerprint(settings: dict) -> str:
@@ -466,7 +496,7 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, sort_by: str, view
     return out
 
 # ================================================================
-# UI components (mostly unchanged)
+# UI helpers & components
 # ================================================================
 def profile_card(row, show_image=True):
     with st.container():
@@ -498,7 +528,7 @@ def action_bar(row, user_state):
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "pass", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
             rehydrate_current_viewer_merge()
-            st.experimental_rerun()
+            safe_rerun()
     with c2:
         if st.button("⭐ Superlike", key=f"super_{row['id']}"):
             if row["id"] not in user_state["superlikes"]:
@@ -506,7 +536,7 @@ def action_bar(row, user_state):
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "superlike", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
             rehydrate_current_viewer_merge()
-            st.experimental_rerun()
+            safe_rerun()
     with c3:
         if st.button("❤️ Like", key=f"like_{row['id']}"):
             if row["id"] not in user_state["likes"]:
@@ -514,7 +544,7 @@ def action_bar(row, user_state):
             log_interaction(st.session_state.active_user, user_state["settings"]["name"], row, "like", row.get("compatibility", 0.0))
             user_state["current_index"] += 1
             rehydrate_current_viewer_merge()
-            st.experimental_rerun()
+            safe_rerun()
     with c4:
         if st.button("👤 View as this person", key=f"viewas_single_{row['id']}"):
             switch_to_profile_as_viewer(row)
@@ -543,7 +573,7 @@ def export_buttons(df, viewer_name, user_state):
     )
 
 # ================================================================
-# Helpers that call API-backed persistence
+# Helpers to change active viewer & hydrate history via API
 # ================================================================
 def switch_to_profile_as_viewer(profile_row: pd.Series):
     vname = f"{profile_row['name']}-{profile_row['id']}"
@@ -561,14 +591,15 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         "likes": [], "passes": [], "superlikes": [],
         "current_index": 0,
     })
-    # upsert the viewer to server via API (no local CSV)
+
     try:
         upsert_viewer_via_api(st.session_state.users[vname]["settings"], viewer_id=vname)
     except Exception as e:
         st.error(f"Failed to upsert viewer: {e}")
         return
+
     st.session_state.active_user = vname
-    # hydrate interactions for this new active user from remote
+
     try:
         disk = hydrate_interactions_for_viewer_remote(vname)
         u = st.session_state.users.get(vname)
@@ -577,6 +608,7 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
     except Exception as e:
         st.error(f"Failed to load interaction history for {vname}: {e}")
+
     st.session_state.grid_page = 1
 
 def rehydrate_current_viewer_merge():
@@ -584,7 +616,6 @@ def rehydrate_current_viewer_merge():
     u = st.session_state.users.get(vid)
     if not u:
         return
-    # fetch remote interactions and merge
     try:
         disk = hydrate_interactions_for_viewer_remote(vid)
     except Exception:
@@ -602,9 +633,7 @@ st.caption("Interactions and viewers persist via API endpoints only. Profiles st
 def health_banner():
     ok_api = False
     ok_get_interactions = False
-    # Prefer GET to '/' or '/health' instead of OPTIONS to a POST-only endpoint.
     try:
-        # check root
         r = requests.get(API_BASE.rstrip("/") + "/", timeout=3.0)
         ok_api = (r.status_code < 400)
     except Exception:
@@ -623,7 +652,7 @@ def health_banner():
 
 health_banner()
 
-# Viewer selection UI
+# Viewer selection
 with st.container():
     st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
@@ -635,7 +664,7 @@ with st.container():
             for _, r in df_choices.iterrows()
         ]
         default_ix = st.session_state.get("pick_profile_ix", 0)
-        default_ix = min(default_ix, len(labels) - 1)
+        default_ix = min(default_ix, max(0, len(labels) - 1))
         def _on_pick_profile_as_viewer():
             ix = st.session_state["pick_profile_ix"]
             pr = df_choices.iloc[ix]
@@ -649,10 +678,10 @@ with st.container():
             on_change=_on_pick_profile_as_viewer,
         )
 
-# Sidebar with settings
+# Sidebar
 with st.sidebar:
     st.header("Viewer Settings")
-    ustate = st.session_state.users[st.session_state.active_user]
+    ustate = get_active()
     s = ustate["settings"]
     generator_interests = compute_all_interests_from_profiles(st.session_state.profiles_df)
     dataset_cities = sorted(st.session_state.profiles_df["city"].dropna().unique().tolist()) if not st.session_state.profiles_df.empty else []
@@ -677,7 +706,6 @@ with st.sidebar:
     total = age_w + dist_w + int_w or 1.0
     s["weights"] = {"age": age_w/total, "distance": dist_w/total, "interests": int_w/total}
 
-    # Persist viewer settings to server on-demand
     if st.button("Save viewer to server"):
         try:
             res = upsert_viewer_via_api(s, st.session_state.active_user)
@@ -746,13 +774,13 @@ with tabs[1]:
         with left:
             if st.button("⬅️ Prev", disabled=(st.session_state.grid_page <= 1)):
                 st.session_state.grid_page = max(1, st.session_state.grid_page - 1)
-                st.experimental_rerun()
+                safe_rerun()
         with mid:
             st.markdown(f"Page **{st.session_state.grid_page} / {total_pages}**  •  Showing **{per_page}** per page")
         with right:
             if st.button("Next ➡️", disabled=(st.session_state.grid_page >= total_pages)):
                 st.session_state.grid_page = min(total_pages, st.session_state.grid_page + 1)
-                st.experimental_rerun()
+                safe_rerun()
         start = (st.session_state.grid_page - 1) * per_page
         end = min(start + per_page, total)
         page_df = df_ranked.iloc[start:end]

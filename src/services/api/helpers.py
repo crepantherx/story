@@ -1,19 +1,3 @@
-from fastapi import FastAPI, Request, Depends, HTTPException, status
-
-MODELS = {
-        "models": {
-            'classification': {
-                "tree": {
-                    "RandomForestClassifier": {'last_trained_on': '2023'},
-                    "DecisionTreeClassifier": {'last_trained_on': '2023'}
-                }
-            },
-            "regression": {
-            }
-        }
-    }
-
-TOKEN = "supersecrettoken123"
 def authenticate(request: Request):
     auth_header = request.headers.get("Authorization")
 
@@ -33,11 +17,3 @@ def authenticate(request: Request):
         )
 
     return True
-
-
-from pydantic import BaseModel
-class ModifyRequest(BaseModel):
-    a: int
-    b: int
-    c: int
-    d: int
