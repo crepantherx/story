@@ -246,3 +246,58 @@ def get_viewer(viewer_id: str):
     if not row:
         raise HTTPException(status_code=404, detail="viewer not found")
     return row
+
+# --- add near other helpers in your FastAPI app (app.py) ---
+def _normalize_execute_response(resp):
+    """
+    Normalize the return value of supabase.execute() into a python list or None.
+    Supabase client may return None, a dict {'data': [...]}, or an object with .data.
+    """
+    if resp is None:
+        return None
+    if isinstance(resp, dict):
+        return resp.get("data")
+    return getattr(resp, "data", None)
+
+
+# --- new endpoint ---
+@app.get("/get_profiles")
+def get_profiles():
+    """
+    Return list of profiles for Streamlit. Each profile should contain fields:
+    id, name, age, gender, region, country, city, distance_km, interests, about, photo_url
+    """
+    try:
+        resp = supabase.table("profiles").select(
+            "id,name,age,gender,region,country,city,distance_km,interests,about,photo_url"
+        ).execute()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to query profiles: {e}")
+
+    data = _normalize_execute_response(resp) or []
+    # ensure each row is a plain dict and convert any Postgres array types to python lists if needed
+    out = []
+    for r in data:
+        if not isinstance(r, dict):
+            continue
+        # defensive normalization
+        row = {
+            "id": str(r.get("id", "")),
+            "name": r.get("name", "") or "",
+            "age": int(r.get("age")) if r.get("age") is not None else 0,
+            "gender": r.get("gender") or "",
+            "region": r.get("region") or "",
+            "country": r.get("country") or "",
+            "city": r.get("city") or "",
+            # keep distance numeric
+            "distance_km": int(r.get("distance_km")) if r.get("distance_km") is not None else 0,
+            # interests might already be list, or comma string — normalize to list
+            "interests": r.get("interests") if isinstance(r.get("interests"), list) else (
+                r.get("interests").split(",") if isinstance(r.get("interests"), str) and r.get("interests").strip() else []
+            ),
+            "about": r.get("about") or "",
+            "photo_url": r.get("photo_url") or "",
+        }
+        out.append(row)
+
+    return out
