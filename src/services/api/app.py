@@ -301,3 +301,241 @@ def get_profiles():
         out.append(row)
 
     return out
+
+@app.get("/sync_sql_and_vector_db")
+def sync_sql_and_vector_db():
+    import sys
+    from supabase import create_client, Client
+
+    # --- config / client ---
+    url: str = "https://tpquhacpoxoschgsarie.supabase.co"
+    key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRwcXVoYWNwb3hvc2NoZ3NhcmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMyMTk3NjksImV4cCI6MjA3ODc5NTc2OX0.T06IB1qnCr8eL1BCvuSypVkS7Cgeu5wdnE8QrSWmb-w"
+
+    if not url or not key:
+        print("Please set SUPABASE_URL and SUPABASE_KEY environment variables.", file=sys.stderr)
+        sys.exit(1)
+
+    supabase: Client = create_client(url, key)
+
+    res = supabase.table("profiles").select("*").execute()
+
+    import pandas as pd
+    profiles = pd.DataFrame(res.data)
+
+    cols_to_club = [c for c in profiles.columns if c != "id"]
+    profiles['text'] = profiles[cols_to_club].to_dict(orient="records")
+
+    from sentence_transformers import SentenceTransformer
+
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    embeddings = model.encode(profiles['text'], batch_size=128, convert_to_numpy=True, normalize_embeddings=True)
+    profiles['embedding'] = list(embeddings)
+
+    profiles = profiles[['id', 'embedding']]
+
+    # safe_pinecone_upsert.py
+    from pinecone import Pinecone
+    import numpy as np
+    import math
+    import json
+    import sys
+    import time
+    from typing import Iterable
+
+    # --- CONFIG ---
+    API_KEY = "pcsk_61UNS7_CWf4kKYfMMbpSf3HgMmtaqMtXZYwemNJRR7b7RUcKc5RioQgNbCdmWd5sCgRx73"  # replace with your key
+    INDEX_NAME = "profiles"
+    DIM = 384  # set appropriate dimension for your embeddings
+    METRIC = "cosine"
+    CLOUD = "aws"  # adjust if needed
+    REGION = "us-east-1"  # adjust if needed
+
+    MAX_BYTES = 4_194_304  # 4 MB Pinecone payload limit
+    SAFETY_MARGIN = 0.85  # aim under the limit
+
+    # your dataframe of profiles (must have .id and .embedding columns)
+    b = profiles  # replace with the variable that holds your DataFrame
+
+    # --- Pinecone client & ServerlessSpec import (try variants) ---
+    pc = Pinecone(api_key=API_KEY)
+
+    if INDEX_NAME in pc.list_indexes():
+        pc.delete_index(INDEX_NAME)
+        print(f"Deleted index: {INDEX_NAME}")
+    else:
+        print(f"Index '{INDEX_NAME}' does not exist. No action taken.")
+    ServerlessSpec = None
+    try:
+        from pinecone import ServerlessSpec
+        # print("Imported ServerlessSpec from pinecone")
+    except Exception:
+        try:
+            from pinecone.core.client.models import ServerlessSpec
+            # print("Imported ServerlessSpec from pinecone.core.client.models")
+        except Exception:
+            ServerlessSpec = None
+            # print("ServerlessSpec not available; will try to create index without spec if needed")
+
+    # helper to list index names in a few SDK variants
+    def list_index_names(pc_client):
+        try:
+            res = pc_client.list_indexes()
+        except Exception as e:
+            # fallback: some clients may raise or return something else
+            raise RuntimeError(f"list_indexes() failed: {e}") from e
+
+        # if object has names() method (newer clients), use it
+        if hasattr(res, "names") and callable(res.names):
+            try:
+                return list(res.names())
+            except Exception:
+                pass
+
+        # otherwise, if it's already an iterable of strings
+        if isinstance(res, (list, tuple, set)):
+            return list(res)
+
+        # last resort: try to coerce to list
+        try:
+            return list(res)
+        except Exception:
+            raise RuntimeError(f"Cannot parse list_indexes() result: {res}")
+
+    # create index if missing (attempt a couple of signatures)
+    def ensure_index(pc_client, name, dimension, metric, serverless_spec=None):
+        names = list_index_names(pc_client)
+        if name in names:
+            print(f"Index '{name}' already exists.")
+            return
+
+        print(f"Index '{name}' not found. Creating...")
+
+        # Try a few ways to create the index depending on SDK surface
+        # Primary approach: pass dimension, metric, spec (if available)
+        try:
+            if serverless_spec is not None:
+                pc_client.create_index(
+                    name=name,
+                    dimension=dimension,
+                    metric=metric,
+                    spec=serverless_spec
+                )
+            else:
+                pc_client.create_index(
+                    name=name,
+                    dimension=dimension,
+                    metric=metric
+                )
+            print("Index created successfully.")
+            return
+        except Exception as e:
+            print("Primary create_index() attempt failed:", e)
+
+        # Older/newer SDKs sometimes expect spec only or different args
+        try:
+            if serverless_spec is not None:
+                pc_client.create_index(
+                    name=name,
+                    spec=serverless_spec
+                )
+                print("Index created successfully (spec-only).")
+                return
+        except Exception as e:
+            print("Spec-only create_index() attempt failed:", e)
+
+        raise RuntimeError("Could not create index with available create_index signatures. "
+                           "Check Pinecone client version and permissions.")
+
+    # --- prepare serverless spec if available ---
+    spec_obj = None
+    if ServerlessSpec is not None:
+        try:
+            spec_obj = ServerlessSpec(cloud=CLOUD, region=REGION)
+        except Exception:
+            # Some ServerlessSpec constructors may accept different kwargs; attempt common ones:
+            try:
+                spec_obj = ServerlessSpec(cloud=CLOUD, region=REGION)  # redundant but explicit
+            except Exception:
+                spec_obj = None
+
+    # Ensure index exists
+    ensure_index(pc, INDEX_NAME, DIM, METRIC, serverless_spec=spec_obj)
+
+    # Obtain index handle
+    index = pc.Index(INDEX_NAME)
+
+    # --- helper: estimate JSON payload bytes per vector (conservative) ---
+    def approx_vector_size_bytes(vector_id: str, embedding) -> int:
+        emb_len = len(embedding)
+        # float32 ~4 bytes; JSON textual representation costs more -> multiply conservatively
+        bytes_for_embedding = emb_len * 4 * 3
+        overhead = 200 + len(str(vector_id))
+        return int(bytes_for_embedding + overhead)
+
+    def make_batches(rows: Iterable, max_batch_bytes: int):
+        batch = []
+        batch_bytes = 0
+        for vid, emb in rows:
+            est = approx_vector_size_bytes(vid, emb)
+            if est > max_batch_bytes and batch:
+                yield batch
+                batch = [(vid, emb)]
+                batch_bytes = est
+                continue
+
+            if (batch_bytes + est) > max_batch_bytes:
+                if batch:
+                    yield batch
+                batch = [(vid, emb)]
+                batch_bytes = est
+            else:
+                batch.append((vid, emb))
+                batch_bytes += est
+
+        if batch:
+            yield batch
+
+    # prepare rows: convert embeddings to float32 lists to reduce size
+    rows = []
+    for _, row in profiles.iterrows():
+        vid = str(row.id)
+        emb = np.asarray(row.embedding, dtype=np.float32).tolist()
+        rows.append((vid, emb))
+
+    target_max = int(MAX_BYTES * SAFETY_MARGIN)
+
+    # optional estimate to help choose initial batch sizes
+    if rows:
+        avg_est = sum(approx_vector_size_bytes(v, e) for v, e in rows) / len(rows)
+        est_batch_size = max(1, int(target_max // avg_est))
+        print(f"Estimated bytes/vector ~{int(avg_est)}; estimated safe batch size ~{est_batch_size}")
+
+    # upload loop with automatic shrinking on payload errors
+    uploaded = 0
+    start = time.time()
+
+    for i, batch in enumerate(make_batches(rows, target_max), start=1):
+        vectors = [(vid, emb) for vid, emb in batch]
+        attempt_batch = vectors
+        while True:
+            try:
+                index.upsert(attempt_batch)
+                uploaded += len(attempt_batch)
+                print(f"Batch {i}: uploaded {len(attempt_batch)} vectors (total {uploaded})")
+                break
+            except Exception as e:
+                msg = str(e).lower()
+                # detect payload-too-large style errors
+                if ("message length too large" in msg or "limit" in msg or "413" in msg or "400" in msg) and len(
+                        attempt_batch) > 1:
+                    new_size = max(1, len(attempt_batch) // 2)
+                    attempt_batch = attempt_batch[:new_size]
+                    print(f"Server rejected batch: shrinking and retrying with {new_size} vectors...")
+                    time.sleep(0.5)
+                    continue
+                # if single vector is too large or another error, raise
+                raise
+
+    end = time.time()
+    print(f"Done. Uploaded {uploaded} vectors in {end - start:.1f} sec.")
+    return {"status": "synced"}
