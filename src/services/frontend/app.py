@@ -23,7 +23,7 @@ st.set_page_config(
 )
 
 # Required environment runtime config
-API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+API_BASE = os.environ.get("API_BASE", "http://api:8080")
 if not API_BASE:
     st.error("API_BASE environment variable is required and must point to your backend (e.g. http://127.0.0.1:8000).")
     st.stop()
