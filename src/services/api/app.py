@@ -10,7 +10,6 @@ app = FastAPI()
 import sys
 from supabase import create_client, Client
 
-# --- config / client ---
 url: str = "https://tpquhacpoxoschgsarie.supabase.co"
 key: str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InRwcXVoYWNwb3hvc2NoZ3NhcmllIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NjMyMTk3NjksImV4cCI6MjA3ODc5NTc2OX0.T06IB1qnCr8eL1BCvuSypVkS7Cgeu5wdnE8QrSWmb-w"
 
@@ -95,7 +94,7 @@ class Interaction(BaseModel):
 
 TABLE = "viewers"
 TABLE_INTERACTIONS = "interactions"
-CONFLICT_KEY = "viewer_id"  # must match the unique/primary key on the table
+CONFLICT_KEY = "viewer_id"
 
 @app.post("/upsert_viewer")
 def upsert_viewer(payload: ViewerUpsert):
@@ -195,7 +194,6 @@ def create_viewers_table():
 
     return {"status": "success", "table": "viewers"}
 
-
 @app.post("/create_interactions_table")
 def create_interactions_table():
     sql = """
@@ -216,7 +214,6 @@ def create_interactions_table():
         raise HTTPException(status_code=400, detail=str(e))
 
     return {"status": "success", "table": "interactions"}
-
 
 @app.get("/get_interactions/{viewer_id}")
 def get_interactions_viewer(viewer_id: str):
@@ -247,7 +244,6 @@ def get_viewer(viewer_id: str):
         raise HTTPException(status_code=404, detail="viewer not found")
     return row
 
-# --- add near other helpers in your FastAPI app (app.py) ---
 def _normalize_execute_response(resp):
     """
     Normalize the return value of supabase.execute() into a python list or None.
@@ -259,8 +255,6 @@ def _normalize_execute_response(resp):
         return resp.get("data")
     return getattr(resp, "data", None)
 
-
-# --- new endpoint ---
 @app.get("/get_profiles")
 def get_profiles():
     """
