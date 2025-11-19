@@ -472,7 +472,12 @@ def profile_card(row, show_image=True):
                 st.write("**Interests**:")
 
 def action_bar(row, user_state):
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    # c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    # c1, c2, c3, c4 = st.columns([0.2, 0.2, 0.2, 0.2])
+    spacer_left, col, spacer_right = st.columns([2, 1, 2])
+    with col:
+        c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+
     with c1:
         if st.button("👎 Pass", key=f"pass_{row['id']}"):
             if row["id"] not in user_state["passes"]:
@@ -497,9 +502,9 @@ def action_bar(row, user_state):
             user_state["current_index"] += 1
             rehydrate_current_viewer_merge()
             safe_rerun()
-    with c4:
-        if st.button("👤 View as this person", key=f"viewas_single_{row['id']}"):
-            switch_to_profile_as_viewer(row)
+    # with c4:
+    #     if st.button("👤 View as this person", key=f"viewas_single_{row['id']}"):
+    #         switch_to_profile_as_viewer(row)
 
 def export_buttons(df, viewer_name, user_state):
     like_ids = set(user_state["likes"])
