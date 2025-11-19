@@ -54,6 +54,7 @@ INTERACTION_FIELDS = [
 def _row_hash(d: dict) -> str:
     return hashlib.md5(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest()
 
+
 def safe_rerun():
     """
     Try to programmatically rerun the Streamlit script using whichever API
@@ -109,6 +110,7 @@ def upsert_viewer_via_api(settings: dict, viewer_id: str) -> dict:
     except Exception:
         return {"status": "success", "raw": r.text}
 
+
 def add_interaction_via_api(row: dict) -> dict:
     url = urljoin(API_BASE.rstrip("/") + "/", "add_interaction")
     try:
@@ -127,6 +129,7 @@ def add_interaction_via_api(row: dict) -> dict:
         return r.json()
     except Exception:
         return {"status": "success", "raw": r.text}
+
 
 def hydrate_interactions_for_viewer_remote(viewer_id: str):
     url = urljoin(API_BASE.rstrip("/") + "/", f"get_interactions/{viewer_id}")
@@ -152,6 +155,7 @@ def hydrate_interactions_for_viewer_remote(viewer_id: str):
     superlikes = [rr["profile_id"] for rr in rows if rr.get("action") == "superlike"]
     return {"likes": likes, "passes": passes, "superlikes": superlikes}
 
+
 def fetch_viewer_row(viewer_id: str) -> dict:
     url = urljoin(API_BASE.rstrip("/") + "/", f"get_viewer/{viewer_id}")
     try:
@@ -173,65 +177,24 @@ def fetch_viewer_row(viewer_id: str) -> dict:
     except Exception as e:
         raise RuntimeError(f"Failed to parse get_viewer response: {e}")
 
-# ----------------------
-# Ensure every /match call sends only the raw id portion (strip name- prefix)
-# ----------------------
-def _strip_name_prefix_from_id(maybe_id: str) -> str:
-    """
-    If the app uses composite keys like "Name-<id>", return the trailing id
-    portion after the first dash. If no dash present, return the original string.
-    """
-    if not isinstance(maybe_id, str):
-        return str(maybe_id)
-    if "-" in maybe_id:
-        return maybe_id.split("-", 1)[1]
-    return maybe_id
 
 def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
-    """
-    Call the configured match endpoint for a given profile/viewer id.
-    Always send only the raw id (strip name prefix if present).
-
-    Returns a dict with keys: ok (bool), status_code (int), url, text, json, and
-    for debugging includes original_viewer_key and sent_id where applicable.
-    """
     if not endpoint_template:
         return {"ok": False, "error": "no endpoint template configured"}
-
-    original_id = str(profile_id)
-    send_id = _strip_name_prefix_from_id(original_id)
-
-    def _build_url(pid: str):
-        if "{profile}" in endpoint_template:
-            return endpoint_template.format(profile=pid)
-        base = endpoint_template.rstrip("/") + "/"
-        return urljoin(base, str(pid).lstrip("/"))
-
     try:
-        url = _build_url(send_id)
+        if "{profile}" in endpoint_template:
+            url = endpoint_template.format(profile=profile_id)
+        else:
+            base = endpoint_template.rstrip("/") + "/"
+            url = urljoin(base, str(profile_id).lstrip("/"))
         resp = requests.get(url, timeout=6.0)
         try:
             parsed = resp.json()
         except Exception:
             parsed = None
-        ok = resp.status_code < 400
-        result = {
-            "ok": ok,
-            "method": "GET",
-            "url": url,
-            "status_code": resp.status_code,
-            "text": resp.text,
-            "json": parsed,
-            "original_viewer_key": original_id,
-            "sent_id": send_id,
-        }
-
-        # If server returns an error, we keep this response but the caller will
-        # treat ok=False and fall back to local ordering. We do not send the
-        # composite name-id to the server at any point.
-        return result
+        return {"ok": True, "method": "GET", "url": url, "status_code": resp.status_code, "text": resp.text, "json": parsed}
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}", "original_viewer_key": original_id, "sent_id": send_id}
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
 # Remote profiles loader (only remote; no CSV fallback)
@@ -316,8 +279,10 @@ def _age_score_vector(age_series: pd.Series, amin: int, amax: int) -> pd.Series:
     score = score.where(inside, other=0.0)
     return score
 
+
 def _distance_score_vector(d_km: pd.Series) -> pd.Series:
     return (1.0 - (d_km.astype(float) / 30.0)).clip(lower=0.0, upper=1.0)
+
 
 def _interest_overlap_vector(interests_col: pd.Series, your_top: set) -> pd.Series:
     if not your_top:
@@ -328,6 +293,7 @@ def _interest_overlap_vector(interests_col: pd.Series, your_top: set) -> pd.Seri
         for v in interests_col
     ]
     return pd.Series(vals, index=interests_col.index)
+
 
 def _settings_fingerprint(settings: dict) -> str:
     payload = {
@@ -343,6 +309,7 @@ def _settings_fingerprint(settings: dict) -> str:
     }
     return _row_hash(payload)
 
+
 def _profiles_fingerprint(df: pd.DataFrame) -> str:
     if df.empty:
         return "empty"
@@ -353,6 +320,7 @@ def _profiles_fingerprint(df: pd.DataFrame) -> str:
     sample = take.iloc[::max(len(take)//500, 1)].to_csv(index=False).encode("utf-8")
     md5.update(sample)
     return md5.hexdigest()
+
 
 def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, viewer_id: str) -> pd.DataFrame:
     """
@@ -382,25 +350,21 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, viewer_id: str) ->
     ordered_ids = None
     try:
         if endpoint_template:
-            # viewer_id may be composite "name-id"; call_match_endpoint_get will
-            # strip to the raw id before building the URL.
             result = call_match_endpoint_get(str(viewer_id), endpoint_template)
-            # Treat HTTP errors as failures.
-            if not result.get("ok") or result.get("status_code", 0) >= 400:
-                # record last match call for debugging and fall through to fallback
-                st.session_state["last_match_call"] = result
-                ordered_ids = None
-            else:
-                st.session_state["last_match_call"] = result
-                j = result.get("json")
+            if result.get("ok") and result.get("json") is not None:
+                j = result["json"]
+                # If server returned a list of profile ids
                 if isinstance(j, list):
                     ordered_ids = [str(x) for x in j]
                 elif isinstance(j, dict):
+                    # support common shapes: {"matches": [ids]} or {"profiles": [{...}]}
                     if "matches" in j and isinstance(j["matches"], list):
                         ordered_ids = [str(x) for x in j["matches"]]
                     elif "profiles" in j and isinstance(j["profiles"], list):
+                        # build a df out of server-provided profiles
                         try:
                             server_df = pd.DataFrame(j["profiles"])
+                            # normalize fields similar to fetch_profiles_remote
                             for c in PROFILES_COLS:
                                 if c not in server_df.columns:
                                     if c in ["age", "distance_km"]:
@@ -418,11 +382,10 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, viewer_id: str) ->
                             return ordered
                         except Exception:
                             ordered_ids = None
+                # if server sent a dict mapping id->score
                 elif isinstance(j, (int, str)):
                     ordered_ids = [str(j)]
-    except Exception as exc:
-        # network / unexpected error — record and move to fallback
-        st.session_state["last_match_call"] = {"ok": False, "error": str(exc)}
+    except Exception:
         ordered_ids = None
 
     if ordered_ids:
@@ -430,11 +393,13 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, viewer_id: str) ->
         id_set = set(ordered_ids)
         ordered_list = [pid for pid in ordered_ids if pid in set(df["id"].astype(str))]
         remaining = df[~df["id"].astype(str).isin(id_set)].copy()
+        # as safety, sort remaining by distance
         remaining = remaining.sort_values(by=["distance_km"]).reset_index(drop=True)
         ordered_df = pd.concat([
             df[df["id"].astype(str).isin(ordered_list)].set_index(df[df["id"].astype(str).isin(ordered_list)]["id"].astype(str)),
             remaining.set_index(remaining["id"].astype(str))
         ], axis=0, sort=False)
+        # ensure the order matches ordered_list first
         ordered_ids_present = [pid for pid in ordered_list if pid in ordered_df.index]
         final = ordered_df.loc[ordered_ids_present + [i for i in ordered_df.index if i not in ordered_ids_present]].reset_index(drop=True)
         cache[key] = final[PROFILES_COLS].copy()
@@ -462,7 +427,7 @@ def profile_card(row, show_image=True):
             else:
                 st.caption(f"{row['name']}, {row['age']} • {row['gender']}")
             st.caption(f"📍 {row['city']} • ~{row.get('distance_km', 0)} km away")
-            # st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
+            st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
         with c2:
             st.subheader(f"{row['name']}")
             st.write(row.get("about", ""))
@@ -470,6 +435,7 @@ def profile_card(row, show_image=True):
                 st.write("**Interests**:", ", ".join(row["interests"]))
             else:
                 st.write("**Interests**:")
+
 
 def action_bar(row, user_state):
     c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
@@ -500,6 +466,7 @@ def action_bar(row, user_state):
     with c4:
         if st.button("👤 View as this person", key=f"viewas_single_{row['id']}"):
             switch_to_profile_as_viewer(row)
+
 
 def export_buttons(df, viewer_name, user_state):
     like_ids = set(user_state["likes"])
@@ -549,7 +516,6 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
 
     match_template = st.session_state.get("interactions_webhook", "").strip()
     if match_template:
-        # profile_row["id"] is already a raw id; call_match_endpoint_get will also strip if needed.
         result = call_match_endpoint_get(str(profile_row["id"]), match_template)
         st.session_state["last_match_call"] = result
     else:
@@ -676,6 +642,7 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         st.error(f"Failed to load interaction history for {vname}: {e}")
     st.session_state.grid_page = 1
 
+
 def rehydrate_current_viewer_merge():
     vid = st.session_state.active_user
     u = st.session_state.users.get(vid)
@@ -692,11 +659,10 @@ def rehydrate_current_viewer_merge():
 # ================================================================
 # App UI / Main
 # ================================================================
-st.title("Realtime Interaction-Driven Recommendations")
-# st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
+st.title("Recommendation (Endpoint-driven)")
+st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
 
 def health_banner():
-    st.subheader("")
     ok_api = False
     ok_get_profiles = False
     try:
@@ -716,11 +682,11 @@ def health_banner():
         f"Get profiles endpoint: {'✅' if ok_get_profiles else '⚠️'}"
     )
 
-
+health_banner()
 
 # Viewer selection UI
 with st.container():
-    # st.subheader("Login as any profile")
+    st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
     if df_choices.empty:
         st.warning("No profiles loaded. Check your backend get_profiles endpoint.")
@@ -749,6 +715,7 @@ with st.container():
 # ensures ordering is not confused with local heuristics.
 
 # Ranking & display — server-driven
+# We no longer allow the user to pick a local "Best match" sorting.
 df_ranked = get_ranked_profiles(st.session_state.profiles_df, st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
 
 m1, m2, m3, m4 = st.columns(4)
@@ -761,7 +728,7 @@ m4.metric("Passes", len(st.session_state.users[st.session_state.active_user].get
 tabs = st.tabs(["Browse", "Grid", "Likes & Passes", "Debug"])
 
 with tabs[0]:
-    # st.subheader("Swipe-ish — server-driven order")
+    st.subheader("Swipe-ish — server-driven order")
     idx = st.session_state.users[st.session_state.active_user]["current_index"]
     if idx >= len(df_ranked) or df_ranked.empty:
         st.success("You're all caught up! Wait for the server to provide more matches or change active viewer.")
@@ -807,7 +774,7 @@ with tabs[1]:
                             except Exception:
                                 pass
                             st.write(f"**{r['name']}**, {r['age']} • {r['gender']}")
-                        # st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compatibility {r.get('compatibility', 0.0):.2f}")
+                        st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compat {r.get('compatibility', 0.0):.2f}")
                         if isinstance(r["interests"], list):
                             st.caption(", ".join(r["interests"]))
                         c1, c2, c3 = st.columns([1, 1, 1])
@@ -902,5 +869,3 @@ with tabs[3]:
     st.info(
         f"API base → {API_BASE}\n\n"
     )
-
-# health_banner()

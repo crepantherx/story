@@ -173,65 +173,23 @@ def fetch_viewer_row(viewer_id: str) -> dict:
     except Exception as e:
         raise RuntimeError(f"Failed to parse get_viewer response: {e}")
 
-# ----------------------
-# Ensure every /match call sends only the raw id portion (strip name- prefix)
-# ----------------------
-def _strip_name_prefix_from_id(maybe_id: str) -> str:
-    """
-    If the app uses composite keys like "Name-<id>", return the trailing id
-    portion after the first dash. If no dash present, return the original string.
-    """
-    if not isinstance(maybe_id, str):
-        return str(maybe_id)
-    if "-" in maybe_id:
-        return maybe_id.split("-", 1)[1]
-    return maybe_id
-
 def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
-    """
-    Call the configured match endpoint for a given profile/viewer id.
-    Always send only the raw id (strip name prefix if present).
-
-    Returns a dict with keys: ok (bool), status_code (int), url, text, json, and
-    for debugging includes original_viewer_key and sent_id where applicable.
-    """
     if not endpoint_template:
         return {"ok": False, "error": "no endpoint template configured"}
-
-    original_id = str(profile_id)
-    send_id = _strip_name_prefix_from_id(original_id)
-
-    def _build_url(pid: str):
-        if "{profile}" in endpoint_template:
-            return endpoint_template.format(profile=pid)
-        base = endpoint_template.rstrip("/") + "/"
-        return urljoin(base, str(pid).lstrip("/"))
-
     try:
-        url = _build_url(send_id)
+        if "{profile}" in endpoint_template:
+            url = endpoint_template.format(profile=profile_id)
+        else:
+            base = endpoint_template.rstrip("/") + "/"
+            url = urljoin(base, str(profile_id).lstrip("/"))
         resp = requests.get(url, timeout=6.0)
         try:
             parsed = resp.json()
         except Exception:
             parsed = None
-        ok = resp.status_code < 400
-        result = {
-            "ok": ok,
-            "method": "GET",
-            "url": url,
-            "status_code": resp.status_code,
-            "text": resp.text,
-            "json": parsed,
-            "original_viewer_key": original_id,
-            "sent_id": send_id,
-        }
-
-        # If server returns an error, we keep this response but the caller will
-        # treat ok=False and fall back to local ordering. We do not send the
-        # composite name-id to the server at any point.
-        return result
+        return {"ok": True, "method": "GET", "url": url, "status_code": resp.status_code, "text": resp.text, "json": parsed}
     except Exception as exc:
-        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}", "original_viewer_key": original_id, "sent_id": send_id}
+        return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
 # Remote profiles loader (only remote; no CSV fallback)
@@ -354,98 +312,38 @@ def _profiles_fingerprint(df: pd.DataFrame) -> str:
     md5.update(sample)
     return md5.hexdigest()
 
-def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, viewer_id: str) -> pd.DataFrame:
-    """
-    Server-driven ranking: attempt to fetch ordered matches from the configured
-    interactions_webhook (/match/<viewer_id> or template). If the server returns
-    an ordered list of profile ids or profiles, use that ordering. Otherwise
-    fall back to a deterministic local ordering (Nearest) purely as a safety
-    fallback.
-    """
+def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, sort_by: str, viewer_id: str) -> pd.DataFrame:
     if raw_df.empty:
         return raw_df.copy()
-
-    cache = st.session_state.ranked_cache
     key = (
         _profiles_fingerprint(raw_df),
         _settings_fingerprint(settings),
+        sort_by,
         viewer_id,
-        st.session_state.get("interactions_webhook", ""),
     )
+    cache = st.session_state.ranked_cache
     if key in cache:
         return cache[key]
-
     df = raw_df.copy()
-
-    # First attempt: call server match endpoint to get authoritative ordering
-    endpoint_template = st.session_state.get("interactions_webhook", "").strip()
-    ordered_ids = None
-    try:
-        if endpoint_template:
-            # viewer_id may be composite "name-id"; call_match_endpoint_get will
-            # strip to the raw id before building the URL.
-            result = call_match_endpoint_get(str(viewer_id), endpoint_template)
-            # Treat HTTP errors as failures.
-            if not result.get("ok") or result.get("status_code", 0) >= 400:
-                # record last match call for debugging and fall through to fallback
-                st.session_state["last_match_call"] = result
-                ordered_ids = None
-            else:
-                st.session_state["last_match_call"] = result
-                j = result.get("json")
-                if isinstance(j, list):
-                    ordered_ids = [str(x) for x in j]
-                elif isinstance(j, dict):
-                    if "matches" in j and isinstance(j["matches"], list):
-                        ordered_ids = [str(x) for x in j["matches"]]
-                    elif "profiles" in j and isinstance(j["profiles"], list):
-                        try:
-                            server_df = pd.DataFrame(j["profiles"])
-                            for c in PROFILES_COLS:
-                                if c not in server_df.columns:
-                                    if c in ["age", "distance_km"]:
-                                        server_df[c] = 0
-                                    elif c == "interests":
-                                        server_df[c] = [[] for _ in range(len(server_df))]
-                                    else:
-                                        server_df[c] = ""
-                            server_df["interests"] = server_df["interests"].apply(lambda v: v if isinstance(v, list) else [])
-                            server_df["age"] = pd.to_numeric(server_df["age"], errors="coerce").fillna(0).astype(int)
-                            server_df["distance_km"] = pd.to_numeric(server_df["distance_km"], errors="coerce").fillna(0).astype(int)
-                            server_df["id"] = server_df["id"].astype(str)
-                            ordered = server_df[PROFILES_COLS].copy().reset_index(drop=True)
-                            cache[key] = ordered
-                            return ordered
-                        except Exception:
-                            ordered_ids = None
-                elif isinstance(j, (int, str)):
-                    ordered_ids = [str(j)]
-    except Exception as exc:
-        # network / unexpected error — record and move to fallback
-        st.session_state["last_match_call"] = {"ok": False, "error": str(exc)}
-        ordered_ids = None
-
-    if ordered_ids:
-        # preserve order from server and append any remaining profiles
-        id_set = set(ordered_ids)
-        ordered_list = [pid for pid in ordered_ids if pid in set(df["id"].astype(str))]
-        remaining = df[~df["id"].astype(str).isin(id_set)].copy()
-        remaining = remaining.sort_values(by=["distance_km"]).reset_index(drop=True)
-        ordered_df = pd.concat([
-            df[df["id"].astype(str).isin(ordered_list)].set_index(df[df["id"].astype(str).isin(ordered_list)]["id"].astype(str)),
-            remaining.set_index(remaining["id"].astype(str))
-        ], axis=0, sort=False)
-        ordered_ids_present = [pid for pid in ordered_list if pid in ordered_df.index]
-        final = ordered_df.loc[ordered_ids_present + [i for i in ordered_df.index if i not in ordered_ids_present]].reset_index(drop=True)
-        cache[key] = final[PROFILES_COLS].copy()
-        return cache[key]
-
-    # Fallback local ordering (Nearest) — used only if server doesn't provide ordering
-    filtered = df.copy()
-    filtered["compatibility"] = 0.0
-    filtered = filtered.sort_values(by=["distance_km"]).reset_index(drop=True)
-    cache[key] = filtered[PROFILES_COLS + ["compatibility"]].copy()
-    return cache[key]
+    mask = df["gender"].isin(settings["seeking"]) & df["age"].between(settings["age_min"], settings["age_max"])
+    filtered = df[mask].copy()
+    if filtered.empty:
+        filtered = df.copy()
+    w = settings["weights"]
+    age_s = _age_score_vector(filtered["age"], settings["age_min"], settings["age_max"])
+    dist_s = _distance_score_vector(filtered["distance_km"])
+    your_set = set(settings.get("top_interests", []) or [])
+    int_s = _interest_overlap_vector(filtered["interests"], your_set)
+    filtered["compatibility"] = (w["age"] * age_s + w["distance"] * dist_s + w["interests"] * int_s).round(3)
+    if sort_by == "Best match":
+        filtered = filtered.sort_values(by=["compatibility", "distance_km"], ascending=[False, True])
+    elif sort_by == "Nearest":
+        filtered = filtered.sort_values(by=["distance_km", "compatibility"], ascending=[True, False])
+    else:
+        filtered = filtered.sample(frac=1, random_state=42)
+    out = filtered.reset_index(drop=True)
+    cache[key] = out
+    return out
 
 # ================================================================
 # UI components
@@ -462,7 +360,7 @@ def profile_card(row, show_image=True):
             else:
                 st.caption(f"{row['name']}, {row['age']} • {row['gender']}")
             st.caption(f"📍 {row['city']} • ~{row.get('distance_km', 0)} km away")
-            # st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
+            st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
         with c2:
             st.subheader(f"{row['name']}")
             st.write(row.get("about", ""))
@@ -549,7 +447,6 @@ def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, a
 
     match_template = st.session_state.get("interactions_webhook", "").strip()
     if match_template:
-        # profile_row["id"] is already a raw id; call_match_endpoint_get will also strip if needed.
         result = call_match_endpoint_get(str(profile_row["id"]), match_template)
         st.session_state["last_match_call"] = result
     else:
@@ -692,11 +589,10 @@ def rehydrate_current_viewer_merge():
 # ================================================================
 # App UI / Main
 # ================================================================
-st.title("Realtime Interaction-Driven Recommendations")
-# st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
+st.title("Recommendation (Endpoint-driven)")
+st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
 
 def health_banner():
-    st.subheader("")
     ok_api = False
     ok_get_profiles = False
     try:
@@ -716,11 +612,11 @@ def health_banner():
         f"Get profiles endpoint: {'✅' if ok_get_profiles else '⚠️'}"
     )
 
-
+health_banner()
 
 # Viewer selection UI
 with st.container():
-    # st.subheader("Login as any profile")
+    st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
     if df_choices.empty:
         st.warning("No profiles loaded. Check your backend get_profiles endpoint.")
@@ -744,12 +640,72 @@ with st.container():
             on_change=_on_pick_profile_as_viewer,
         )
 
-# NOTE: Sidebar removed — client-side controls are intentionally disabled. The server
-# is authoritative for ordering via the /match endpoint. This simplifies the UI and
-# ensures ordering is not confused with local heuristics.
+# Sidebar with settings
+with st.sidebar:
+    st.header("Viewer Settings")
+    ustate = st.session_state.users[st.session_state.active_user]
+    s = ustate["settings"]
+    generator_interests = compute_all_interests_from_profiles(st.session_state.profiles_df)
+    dataset_cities = sorted(st.session_state.profiles_df["city"].dropna().unique().tolist()) if not st.session_state.profiles_df.empty else []
+    default_city = s.get("city") if s.get("city") in dataset_cities else (dataset_cities[0] if dataset_cities else "Mumbai")
+    s["name"] = st.text_input("Your name", s["name"])
+    s["age"] = st.number_input("Your age", min_value=18, max_value=80, value=int(s["age"]), step=1)
+    s["city"] = st.selectbox("Your city", dataset_cities or ["Mumbai"], index=(dataset_cities.index(default_city) if dataset_cities and default_city in dataset_cities else 0))
+    s["seeking"] = st.multiselect("Show me", GENDERS, default=s["seeking"])
+    c1, c2 = st.columns(2)
+    with c1:
+        s["age_min"] = st.number_input("Min age", 18, 80, int(s["age_min"]), step=1)
+    with c2:
+        s["age_max"] = st.number_input("Max age", 18, 80, int(s["age_max"]), step=1)
+    st.markdown("**Top interests** (helps ranking)")
+    default_interest_seed = [i for i in s.get("top_interests", []) if i in generator_interests][:5]
+    fallback = generator_interests[:3] if generator_interests else []
+    s["top_interests"] = st.multiselect("Pick up to 5", generator_interests, default=(default_interest_seed or fallback), max_selections=5)
+    st.markdown("**Scoring weights**")
+    age_w = st.slider("Age fit", 0.0, 1.0, float(s["weights"]["age"]), 0.05)
+    dist_w = st.slider("Distance", 0.0, 1.0, float(s["weights"]["distance"]), 0.05)
+    int_w = st.slider("Interests overlap", 0.0, 1.0, float(s["weights"]["interests"]), 0.05)
+    total = age_w + dist_w + int_w or 1.0
+    s["weights"] = {"age": age_w/total, "distance": dist_w/total, "interests": int_w/total}
 
-# Ranking & display — server-driven
-df_ranked = get_ranked_profiles(st.session_state.profiles_df, st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
+    if st.button("Save viewer to server"):
+        try:
+            res = upsert_viewer_via_api(s, st.session_state.active_user)
+            st.success("Saved to server.")
+        except Exception as e:
+            st.error(f"Save failed: {e}")
+
+    st.divider()
+    st.subheader("Profiles")
+    st.caption("Profiles are loaded from the backend.")
+    if st.button("🔄 Reload profiles from server"):
+        try:
+            st.session_state.profiles_df = fetch_profiles_remote(API_BASE)
+            st.session_state.ranked_cache.clear()
+            for uname in st.session_state.users:
+                st.session_state.users[uname]["current_index"] = 0
+            st.success(f"Loaded {len(st.session_state.profiles_df)} profiles from backend")
+        except Exception as e:
+            st.error(f"Failed to fetch profiles: {e}")
+
+    st.divider()
+    st.subheader("Performance")
+    st.session_state.low_bandwidth = st.checkbox("Low-bandwidth mode (hide images in Grid)", value=st.session_state.low_bandwidth)
+    st.session_state.grid_page_size = st.number_input("Grid page size", 3, 30, st.session_state.grid_page_size, 3)
+
+    st.divider()
+    st.subheader("Match endpoint (path)")
+    st.caption("Enter either a template with '{profile}' or a base path. Example: http://127.0.0.1:8000/match/{profile}")
+    st.text_input("Interactions webhook URL (template or base)", key="interactions_webhook", value=st.session_state.get("interactions_webhook"))
+    st.caption("When you Like/Pass/Superlike the app will call GET /match/<profile_id> and show the response in Debug.")
+
+    st.divider()
+    st.subheader("Backend info")
+    st.write(f"API base: `{API_BASE}`")
+
+# Ranking & display
+sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
+df_ranked = get_ranked_profiles(st.session_state.profiles_df, st.session_state.users[st.session_state.active_user]["settings"], sort_by, st.session_state.active_user)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Profiles available", len(df_ranked))
@@ -761,19 +717,19 @@ m4.metric("Passes", len(st.session_state.users[st.session_state.active_user].get
 tabs = st.tabs(["Browse", "Grid", "Likes & Passes", "Debug"])
 
 with tabs[0]:
-    # st.subheader("Swipe-ish — server-driven order")
+    st.subheader("Swipe-ish")
     idx = st.session_state.users[st.session_state.active_user]["current_index"]
     if idx >= len(df_ranked) or df_ranked.empty:
-        st.success("You're all caught up! Wait for the server to provide more matches or change active viewer.")
+        st.success("You're all caught up! Adjust filters or reload profiles.")
     else:
         row = df_ranked.iloc[idx]
         profile_card(row, show_image=True)
         action_bar(row, st.session_state.users[st.session_state.active_user])
 
 with tabs[1]:
-    st.subheader("All Profiles (paginated) — server order")
+    st.subheader("All Profiles (paginated)")
     if df_ranked.empty:
-        st.info("No profiles to show. Reload your profiles from backend or wait for server matches.")
+        st.info("No profiles to show. Reload your profiles from backend or relax filters.")
     else:
         total = len(df_ranked)
         per_page = int(st.session_state.grid_page_size)
@@ -807,7 +763,7 @@ with tabs[1]:
                             except Exception:
                                 pass
                             st.write(f"**{r['name']}**, {r['age']} • {r['gender']}")
-                        # st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compatibility {r.get('compatibility', 0.0):.2f}")
+                        st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compat {r['compatibility']:.2f}")
                         if isinstance(r["interests"], list):
                             st.caption(", ".join(r["interests"]))
                         c1, c2, c3 = st.columns([1, 1, 1])
@@ -902,5 +858,3 @@ with tabs[3]:
     st.info(
         f"API base → {API_BASE}\n\n"
     )
-
-# health_banner()

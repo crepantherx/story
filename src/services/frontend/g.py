@@ -462,7 +462,7 @@ def profile_card(row, show_image=True):
             else:
                 st.caption(f"{row['name']}, {row['age']} • {row['gender']}")
             st.caption(f"📍 {row['city']} • ~{row.get('distance_km', 0)} km away")
-            # st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
+            st.progress(row.get("compatibility", 0.0), text=f"Compat: {row.get('compatibility', 0.0):.2f}")
         with c2:
             st.subheader(f"{row['name']}")
             st.write(row.get("about", ""))
@@ -692,11 +692,10 @@ def rehydrate_current_viewer_merge():
 # ================================================================
 # App UI / Main
 # ================================================================
-st.title("Realtime Interaction-Driven Recommendations")
-# st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
+st.title("Recommendation (Endpoint-driven)")
+st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
 
 def health_banner():
-    st.subheader("")
     ok_api = False
     ok_get_profiles = False
     try:
@@ -716,11 +715,11 @@ def health_banner():
         f"Get profiles endpoint: {'✅' if ok_get_profiles else '⚠️'}"
     )
 
-
+health_banner()
 
 # Viewer selection UI
 with st.container():
-    # st.subheader("Login as any profile")
+    st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
     if df_choices.empty:
         st.warning("No profiles loaded. Check your backend get_profiles endpoint.")
@@ -761,7 +760,7 @@ m4.metric("Passes", len(st.session_state.users[st.session_state.active_user].get
 tabs = st.tabs(["Browse", "Grid", "Likes & Passes", "Debug"])
 
 with tabs[0]:
-    # st.subheader("Swipe-ish — server-driven order")
+    st.subheader("Swipe-ish — server-driven order")
     idx = st.session_state.users[st.session_state.active_user]["current_index"]
     if idx >= len(df_ranked) or df_ranked.empty:
         st.success("You're all caught up! Wait for the server to provide more matches or change active viewer.")
@@ -807,7 +806,7 @@ with tabs[1]:
                             except Exception:
                                 pass
                             st.write(f"**{r['name']}**, {r['age']} • {r['gender']}")
-                        # st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compatibility {r.get('compatibility', 0.0):.2f}")
+                        st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compat {r.get('compatibility', 0.0):.2f}")
                         if isinstance(r["interests"], list):
                             st.caption(", ".join(r["interests"]))
                         c1, c2, c3 = st.columns([1, 1, 1])
@@ -902,5 +901,3 @@ with tabs[3]:
     st.info(
         f"API base → {API_BASE}\n\n"
     )
-
-# health_banner()
