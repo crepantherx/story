@@ -1,14 +1,17 @@
-# streamlit_app.py
+# app.py — Streamlit app (endpoint-driven) — full fixed version
+# Run with: API_BASE=http://127.0.0.1:8000 streamlit run app.py
+
 import os
 import json
 import hashlib
-from urllib.parse import urljoin
+import traceback
 from datetime import datetime, timezone
-import random
+from urllib.parse import urljoin
+from typing import Any
 
 import pandas as pd
-import requests
 import streamlit as st
+import requests
 
 # ================================================================
 # Config / constants
@@ -22,87 +25,156 @@ st.set_page_config(
     layout="wide",
 )
 
-# Required environment runtime config
-API_BASE = os.environ.get("API_BASE", "http://127.0.0.1:8000")
+API_BASE = "http://0.0.0.0:8000"
 if not API_BASE:
     st.error("API_BASE environment variable is required and must point to your backend (e.g. http://127.0.0.1:8000).")
     st.stop()
 
 # ================================================================
-# Columns / shapes
+# Fields and column constants
 # ================================================================
 VIEWER_COLS = [
-    "viewer_id", "name", "age", "city",
-    "seeking", "age_min", "age_max", "top_interests",
-    "w_age", "w_distance", "w_interests",
-    "created_at", "updated_at"
+    "viewer_id","name","age","city",
+    "seeking","age_min","age_max","top_interests",
+    "w_age","w_distance","w_interests",
+    "created_at","updated_at"
 ]
 
 PROFILES_COLS = [
-    "id", "name", "age", "gender", "region", "country", "city",
-    "distance_km", "interests", "about", "photo_url"
+    "id","name","age","gender","region","country","city",
+    "distance_km","interests","about","photo_url"
 ]
 
 INTERACTION_FIELDS = [
-    "timestamp", "viewer_id", "viewer_name", "profile_id",
-    "profile_name", "action", "compatibility"
+    "timestamp","viewer_id","viewer_name","profile_id",
+    "profile_name","action","compatibility"
 ]
 
 # ================================================================
 # Small helpers
 # ================================================================
+def _parse_interests(val):
+    if isinstance(val, list):
+        return val
+    try:
+        x = json.loads(val)
+        return x if isinstance(x, list) else []
+    except Exception:
+        pass
+    s = str(val).strip()
+    if s.startswith('[') and s.endswith(']'):
+        inner = s[1:-1]
+        parts = [p.strip().strip("'").strip('"') for p in inner.split(",") if p.strip()]
+        return [p for p in parts if p]
+    if "," in s:
+        return [p.strip() for p in s.split(",") if p.strip()]
+    return []
+
+def _ensure_list(x):
+    if x is None:
+        return None
+    if isinstance(x, list):
+        return x
+    try:
+        parsed = json.loads(x)
+        if isinstance(parsed, list):
+            return parsed
+    except Exception:
+        pass
+    if isinstance(x, str) and "," in x:
+        return [p.strip() for p in x.split(",") if p.strip()]
+    return [x]
+
+def _safe_int(v, default=None):
+    if v is None:
+        return default
+    try:
+        return int(v)
+    except Exception:
+        return default
+
+def _safe_float(v, default=None):
+    if v is None:
+        return default
+    try:
+        return float(v)
+    except Exception:
+        return default
+
 def _row_hash(d: dict) -> str:
     return hashlib.md5(json.dumps(d, sort_keys=True).encode("utf-8")).hexdigest()
 
+# Streamlit versions differ; safe rerun tries experimental_rerun then falls back
 def safe_rerun():
-    """
-    Try to programmatically rerun the Streamlit script using whichever API
-    exists on the installed Streamlit version.
-    """
     try:
-        return st.experimental_rerun()
+        st.experimental_rerun()
     except Exception:
-        try:
-            return st.rerun()
-        except Exception:
-            # Can't programmatically rerun; instruct user to refresh
-            raise RuntimeError(
-                "Programmatic rerun not available in this Streamlit installation. "
-                "Please refresh the page manually or upgrade Streamlit (`pip install -U streamlit`)."
-            )
+        # force small session change so page refreshes
+        st.session_state["_rerun_count"] = st.session_state.get("_rerun_count", 0) + 1
+        return
+
+def get_active():
+    return st.session_state.users[st.session_state.active_user]
 
 # ================================================================
-# API callers (used for saving viewers & interactions)
+# API helpers — upsert viewer, add interaction, fetch history
 # ================================================================
 def upsert_viewer_via_api(settings: dict, viewer_id: str) -> dict:
+    """
+    Calls POST {API_BASE}/upsert_viewer to upsert one viewer.
+    Defensive about types to avoid 422 errors from backend.
+    Maps settings['weights'] -> w_age, w_distance, w_interests.
+    """
     url = urljoin(API_BASE.rstrip("/") + "/", "upsert_viewer")
     payload = {"viewer_id": viewer_id}
-    # Map simple fields
-    for f in ["name", "age", "city", "seeking", "age_min", "age_max", "top_interests"]:
-        val = settings.get(f)
-        if val is not None:
-            payload[f] = val
 
-    # Map weights -> w_age, w_distance, w_interests
+    # text fields
+    for key in ("name", "city"):
+        val = settings.get(key)
+        if val is not None:
+            payload[key] = val
+
+    # ints
+    age = _safe_int(settings.get("age"))
+    if age is not None:
+        payload["age"] = age
+    age_min = _safe_int(settings.get("age_min"))
+    if age_min is not None:
+        payload["age_min"] = age_min
+    age_max = _safe_int(settings.get("age_max"))
+    if age_max is not None:
+        payload["age_max"] = age_max
+
+    # lists
+    seeking = _ensure_list(settings.get("seeking"))
+    if seeking is not None:
+        payload["seeking"] = seeking
+    top_interests = _ensure_list(settings.get("top_interests"))
+    if top_interests is not None:
+        payload["top_interests"] = top_interests
+
+    # weights -> explicit numeric fields
     w = settings.get("weights") or {}
     if "age" in w:
-        payload["w_age"] = float(w["age"])
+        payload["w_age"] = _safe_float(w.get("age"), 0.0)
     if "distance" in w:
-        payload["w_distance"] = float(w["distance"])
+        payload["w_distance"] = _safe_float(w.get("distance"), 0.0)
     if "interests" in w:
-        payload["w_interests"] = float(w["interests"])
+        payload["w_interests"] = _safe_float(w.get("interests"), 0.0)
 
+    # send request
     try:
         r = requests.post(url, json=payload, timeout=10.0)
     except Exception as e:
         raise RuntimeError(f"Failed to call upsert endpoint: {e}")
 
+    # surface backend errors clearly
     if r.status_code >= 400:
         try:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Upsert failed ({r.status_code}): {err}")
+        raise RuntimeError(f"Upsert failed ({r.status_code}): {err}\nPayload: {json.dumps(payload, default=str)}")
 
     try:
         return r.json()
@@ -121,7 +193,7 @@ def add_interaction_via_api(row: dict) -> dict:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Add interaction failed ({r.status_code}): {err}")
+        raise RuntimeError(f"Add interaction failed ({r.status_code}): {err}\nPayload: {json.dumps(row, default=str)}")
 
     try:
         return r.json()
@@ -157,7 +229,7 @@ def fetch_viewer_row(viewer_id: str) -> dict:
     try:
         r = requests.get(url, timeout=6.0)
     except Exception as e:
-        raise RuntimeError(f"Failed to call backend get_viewer: {e}")
+        raise RuntimeError(f"Failed to call get_viewer: {e}")
 
     if r.status_code == 404:
         return None
@@ -166,13 +238,16 @@ def fetch_viewer_row(viewer_id: str) -> dict:
             err = r.json()
         except Exception:
             err = r.text
-        raise RuntimeError(f"Backend get_viewer error ({r.status_code}): {err}")
+        raise RuntimeError(f"get_viewer failed ({r.status_code}): {err}")
 
     try:
         return r.json()
     except Exception as e:
         raise RuntimeError(f"Failed to parse get_viewer response: {e}")
 
+# ================================================================
+# Match endpoint helper
+# ================================================================
 def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
     if not endpoint_template:
         return {"ok": False, "error": "no endpoint template configured"}
@@ -192,68 +267,70 @@ def call_match_endpoint_get(profile_id: str, endpoint_template: str) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}: {str(exc)}"}
 
 # ================================================================
-# Remote profiles loader (only remote; no CSV fallback)
+# Interaction logging / UI flow
 # ================================================================
+def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
+    ts = datetime.now(timezone.utc).isoformat()
+    row = {
+        "timestamp": ts,
+        "viewer_id": str(viewer_key),
+        "viewer_name": str(viewer_name),
+        "profile_id": str(profile_row["id"]),
+        "profile_name": str(profile_row.get("name", "")),
+        "action": str(action),
+        "compatibility": float(compatibility) if compatibility is not None else None,
+    }
+
+    try:
+        add_res = add_interaction_via_api(row)
+        st.session_state["last_add_interaction"] = {"ok": True, "response": add_res}
+    except Exception as e:
+        st.session_state["last_add_interaction"] = {"ok": False, "error": str(e)}
+        st.error(f"Failed to add interaction: {e}")
+        return
+
+    match_template = st.session_state.get("interactions_webhook", "").strip()
+    if match_template:
+        result = call_match_endpoint_get(str(profile_row["id"]), match_template)
+        st.session_state["last_match_call"] = result
+    else:
+        st.session_state["last_match_call"] = {"ok": False, "error": "no match endpoint configured"}
+
+# ================================================================
+# Profiles CSV loader (local)
+# ================================================================
+@st.cache_data(show_spinner=False)
+def _file_mtime(path: str):
+    try:
+        return os.path.getmtime(path)
+    except Exception:
+        return None
+
 @st.cache_data(show_spinner=True)
-def fetch_profiles_remote(api_base: str) -> pd.DataFrame:
-    """
-    Calls {api_base}/get_profiles and returns a DataFrame matching PROFILES_COLS.
-    """
-    url = urljoin(api_base.rstrip("/") + "/", "get_profiles")
-    try:
-        r = requests.get(url, timeout=8.0)
-        r.raise_for_status()
-    except Exception as e:
-        raise RuntimeError(f"Failed to fetch profiles from backend: {e}")
+def load_profiles_cached(path: str, mtime) -> pd.DataFrame:
+    return load_profiles(path)
 
-    try:
-        rows = r.json() or []
-    except Exception as e:
-        raise RuntimeError(f"Failed to parse profiles response: {e}")
-
-    df = pd.DataFrame(rows)
-    # ensure columns exist
-    for c in PROFILES_COLS:
-        if c not in df.columns:
-            if c in ["age", "distance_km"]:
-                df[c] = 0
-            elif c == "interests":
-                df[c] = [[] for _ in range(len(df))]
-            else:
-                df[c] = ""
-
-    # Normalize interests field to list
-    def _norm_interests(v):
-        if isinstance(v, list):
-            return v
-        if isinstance(v, str):
-            s = v.strip()
-            if not s:
-                return []
-            if s.startswith("[") and s.endswith("]"):
-                try:
-                    return json.loads(s)
-                except Exception:
-                    pass
-            return [p.strip() for p in s.split(",") if p.strip()]
-        return []
-
-    df["interests"] = df["interests"].apply(_norm_interests)
-
-    # Numeric columns
-    df["age"] = pd.to_numeric(df["age"], errors="coerce").fillna(0).astype(int)
-    df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).astype(int)
-
-    # text columns
-    for col in ["region", "country", "city", "about", "photo_url", "gender", "name"]:
-        df[col] = df[col].fillna("")
-
+def load_profiles(path: str) -> pd.DataFrame:
+    if not os.path.exists(path):
+        st.error(f"Profiles file not found at: {path}")
+        return pd.DataFrame(columns=PROFILES_COLS)
+    df = pd.read_csv(path, converters={"id": str, "interests": _parse_interests})
+    missing = [c for c in PROFILES_COLS if c not in df.columns]
+    if missing:
+        st.error(f"profiles.csv missing columns: {missing}")
+        return pd.DataFrame(columns=PROFILES_COLS)
     df["id"] = df["id"].astype(str)
+    if "age" in df:
+        df["age"] = pd.to_numeric(df["age"], errors="coerce").fillna(0).astype(int)
+    if "distance_km" in df:
+        df["distance_km"] = pd.to_numeric(df["distance_km"], errors="coerce").fillna(0).astype(int)
+    for col in ["region","country","city","about","photo_url"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("")
+    if "gender" in df.columns:
+        df["gender"] = df["gender"].fillna("")
     return df[PROFILES_COLS].copy()
 
-# ================================================================
-# Compute helper
-# ================================================================
 def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
     s = set()
     if "interests" in df.columns:
@@ -263,7 +340,83 @@ def compute_all_interests_from_profiles(df: pd.DataFrame) -> list:
     return sorted(s)
 
 # ================================================================
-# Scoring & ranking functions (unchanged)
+# Application state bootstrapping (wrapped with debug catcher)
+# ================================================================
+def ensure_state():
+    # default CSV path and load local profiles
+    if "profiles_csv" not in st.session_state:
+        st.session_state.profiles_csv = "./profiles.csv"
+    if "profiles_df" not in st.session_state:
+        mt = _file_mtime(st.session_state.profiles_csv)
+        st.session_state.profiles_df = load_profiles_cached(st.session_state.profiles_csv, mt)
+
+    # user state
+    if "users" not in st.session_state:
+        st.session_state.users = {}
+    if "active_user" not in st.session_state:
+        st.session_state.users["Default"] = {
+            "settings": {
+                "name": "Default", "age": 28, "city": "Mumbai",
+                "seeking": ["Woman","Man","Non-binary"],
+                "age_min": 22, "age_max": 40,
+                "top_interests": ["Music","Travel","Foodie"],
+                "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
+            },
+            "likes": [], "passes": [], "superlikes": [],
+            "current_index": 0,
+        }
+        st.session_state.active_user = "Default"
+
+    if "interactions_webhook" not in st.session_state:
+        st.session_state.interactions_webhook = API_BASE.rstrip("/") + "/match/{profile}"
+
+    st.session_state.setdefault("ranked_cache", {})
+    st.session_state.setdefault("grid_page", 1)
+    st.session_state.setdefault("grid_page_size", GRID_PAGE_SIZE_DEFAULT)
+    st.session_state.setdefault("low_bandwidth", True)
+    st.session_state.setdefault("last_match_call", {"ok": False, "error": "no calls yet"})
+    st.session_state.setdefault("last_add_interaction", {"ok": False, "error": "no calls yet"})
+
+    # Ensure default active user exists server-side (upsert). If backend returns 422 or other,
+    # raise exception so debug wrapper can show full error.
+    upsert_viewer_via_api(st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
+
+    # Hydrate interactions from backend for active user
+    disk = hydrate_interactions_for_viewer_remote(st.session_state.active_user)
+    u = st.session_state.users.get(st.session_state.active_user)
+    u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
+    u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
+    u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
+
+# ================= DEBUG WRAPPER for ensure_state =================
+try:
+    ensure_state()
+except Exception as e:
+    st.error("Startup error in ensure_state() — showing details below.")
+    st.markdown("**Exception:**")
+    st.code(f"{type(e).__name__}: {e}")
+    st.markdown("**Traceback:**")
+    st.code(traceback.format_exc())
+    st.markdown("**Runtime diagnostics**")
+    st.write({"API_BASE": API_BASE})
+    st.write("Profiles CSV path (session_state):", st.session_state.get("profiles_csv"))
+    p = st.session_state.get("profiles_csv")
+    if p:
+        try:
+            st.write("profiles.csv exists:", os.path.exists(p))
+            if os.path.exists(p):
+                st.write("profiles.csv first 10 lines:")
+                with open(p, "r", encoding="utf-8") as fh:
+                    for i, ln in enumerate(fh):
+                        st.write(ln.rstrip())
+                        if i >= 9:
+                            break
+        except Exception as ex:
+            st.write("Failed to read profiles.csv:", ex)
+    st.stop()
+
+# ================================================================
+# Ranking & scoring functions (unchanged)
 # ================================================================
 def _age_score_vector(age_series: pd.Series, amin: int, amax: int) -> pd.Series:
     mid = (amin + amax) / 2.0
@@ -281,10 +434,7 @@ def _interest_overlap_vector(interests_col: pd.Series, your_top: set) -> pd.Seri
     if not your_top:
         return pd.Series(0.0, index=interests_col.index)
     denom = float(len(your_top))
-    vals = [
-        (len(your_top.intersection(set(v if isinstance(v, list) else []))) / denom)
-        for v in interests_col
-    ]
+    vals = [(len(your_top.intersection(set(v if isinstance(v, list) else []))) / denom) for v in interests_col]
     return pd.Series(vals, index=interests_col.index)
 
 def _settings_fingerprint(settings: dict) -> str:
@@ -304,7 +454,7 @@ def _settings_fingerprint(settings: dict) -> str:
 def _profiles_fingerprint(df: pd.DataFrame) -> str:
     if df.empty:
         return "empty"
-    cols = ["id", "age", "gender", "city", "country", "distance_km"]
+    cols = ["id","age","gender","city","country","distance_km"]
     take = df[cols].astype(str)
     md5 = hashlib.md5()
     md5.update(str(len(df)).encode("utf-8"))
@@ -346,7 +496,7 @@ def get_ranked_profiles(raw_df: pd.DataFrame, settings: dict, sort_by: str, view
     return out
 
 # ================================================================
-# UI components
+# UI helpers & components
 # ================================================================
 def profile_card(row, show_image=True):
     with st.container():
@@ -370,7 +520,7 @@ def profile_card(row, show_image=True):
                 st.write("**Interests**:")
 
 def action_bar(row, user_state):
-    c1, c2, c3, c4 = st.columns([1, 1, 1, 1])
+    c1, c2, c3, c4 = st.columns([1,1,1,1])
     with c1:
         if st.button("👎 Pass", key=f"pass_{row['id']}"):
             if row["id"] not in user_state["passes"]:
@@ -423,146 +573,33 @@ def export_buttons(df, viewer_name, user_state):
     )
 
 # ================================================================
-# Interaction logging — calls API and match endpoint
-# ================================================================
-def log_interaction(viewer_key: str, viewer_name: str, profile_row: pd.Series, action: str, compatibility: float):
-    ts = datetime.now(timezone.utc).isoformat()
-    row = {
-        "timestamp": ts,
-        "viewer_id": str(viewer_key),
-        "viewer_name": str(viewer_name),
-        "profile_id": str(profile_row["id"]),
-        "profile_name": str(profile_row.get("name", "")),
-        "action": str(action),
-        "compatibility": float(compatibility) if compatibility is not None else None,
-    }
-
-    try:
-        add_res = add_interaction_via_api(row)
-        st.session_state["last_add_interaction"] = {"ok": True, "response": add_res}
-    except Exception as e:
-        st.session_state["last_add_interaction"] = {"ok": False, "error": str(e)}
-        st.error(f"Failed to add interaction: {e}")
-        return
-
-    match_template = st.session_state.get("interactions_webhook", "").strip()
-    if match_template:
-        result = call_match_endpoint_get(str(profile_row["id"]), match_template)
-        st.session_state["last_match_call"] = result
-    else:
-        st.session_state["last_match_call"] = {"ok": False, "error": "no match endpoint configured"}
-
-# ================================================================
-# Application state bootstrapping (remote-only profiles)
-# ================================================================
-def ensure_state():
-    # Load remote profiles
-    if "profiles_df" not in st.session_state:
-        try:
-            st.session_state.profiles_df = fetch_profiles_remote(API_BASE)
-        except Exception as e:
-            st.error(f"Failed to load profiles from backend: {e}")
-            st.stop()
-
-    # ensure there is at least one profile
-    if st.session_state.profiles_df.empty:
-        st.error("No profiles returned from backend. Ensure /get_profiles returns data.")
-        st.stop()
-
-    # Users container
-    if "users" not in st.session_state:
-        st.session_state.users = {}
-
-    # Choose a random profile on first load to act as the logged-in viewer (no "Default")
-    if "active_user" not in st.session_state:
-        # pick a random profile row
-        try:
-            pr = st.session_state.profiles_df.sample(n=1, random_state=random.randint(1, 10**9)).iloc[0]
-        except Exception:
-            # fallback deterministic pick
-            pr = st.session_state.profiles_df.iloc[0]
-        vname = f"{pr['name']}-{pr['id']}"
-        # create user state from profile
-        st.session_state.users[vname] = {
-            "settings": {
-                "name": pr.get("name", vname),
-                "age": int(pr.get("age", 28)) if pd.notna(pr.get("age", None)) else 28,
-                "city": pr.get("city", ""),
-                "seeking": GENDERS[:],
-                "age_min": max(18, int(pr.get("age", 23)) - 5) if pd.notna(pr.get("age", None)) else 18,
-                "age_max": min(80, int(pr.get("age", 23)) + 5) if pd.notna(pr.get("age", None)) else 40,
-                "top_interests": list(pr.get("interests", [])[:3]) if isinstance(pr.get("interests", []), list) else [],
-                "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
-            },
-            "likes": [], "passes": [], "superlikes": [],
-            "current_index": 0,
-        }
-        st.session_state.active_user = vname
-
-    # interaction webhook default
-    if "interactions_webhook" not in st.session_state:
-        st.session_state.interactions_webhook = API_BASE.rstrip("/") + "/match/{profile}"
-
-    # caches & UI state
-    if "ranked_cache" not in st.session_state:
-        st.session_state.ranked_cache = {}
-    if "grid_page" not in st.session_state:
-        st.session_state.grid_page = 1
-    if "grid_page_size" not in st.session_state:
-        st.session_state.grid_page_size = GRID_PAGE_SIZE_DEFAULT
-    if "low_bandwidth" not in st.session_state:
-        st.session_state.low_bandwidth = True
-
-    if "last_match_call" not in st.session_state:
-        st.session_state["last_match_call"] = {"ok": False, "error": "no calls yet"}
-    if "last_add_interaction" not in st.session_state:
-        st.session_state["last_add_interaction"] = {"ok": False, "error": "no calls yet"}
-
-    # Ensure active user exists server-side (upsert)
-    try:
-        upsert_viewer_via_api(st.session_state.users[st.session_state.active_user]["settings"], st.session_state.active_user)
-    except Exception as e:
-        st.error(f"Failed to upsert active viewer on startup: {e}")
-        st.stop()
-
-    # Hydrate interactions for active user from backend
-    try:
-        disk = hydrate_interactions_for_viewer_remote(st.session_state.active_user)
-        u = st.session_state.users.get(st.session_state.active_user)
-        u["likes"] = sorted(set(u.get("likes", [])) | set(disk.get("likes", [])))
-        u["passes"] = sorted(set(u.get("passes", [])) | set(disk.get("passes", [])))
-        u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
-    except Exception as e:
-        st.error(f"Failed to load interaction history: {e}")
-        st.stop()
-
-ensure_state()
-
-# ================================================================
-# profile-as-viewer and rehydration helpers
+# Helpers to change active viewer & hydrate history via API
 # ================================================================
 def switch_to_profile_as_viewer(profile_row: pd.Series):
     vname = f"{profile_row['name']}-{profile_row['id']}"
     st.session_state.users.setdefault(vname, {
         "settings": {
-            "name": profile_row.get("name", vname),
-            "age": int(profile_row.get("age", 28)) if pd.notna(profile_row.get("age", None)) else 28,
+            "name": profile_row["name"],
+            "age": int(profile_row["age"]),
             "city": profile_row.get("city", ""),
             "seeking": GENDERS[:],
-            "age_min": max(18, int(profile_row.get("age", 23)) - 5) if pd.notna(profile_row.get("age", None)) else 18,
-            "age_max": min(80, int(profile_row.get("age", 23)) + 5) if pd.notna(profile_row.get("age", None)) else 40,
+            "age_min": max(18, int(profile_row["age"]) - 5),
+            "age_max": min(80, int(profile_row["age"]) + 5),
             "top_interests": list(profile_row.get("interests", [])[:3]) if isinstance(profile_row.get("interests", []), list) else [],
             "weights": {"age": 0.3, "distance": 0.2, "interests": 0.5},
         },
         "likes": [], "passes": [], "superlikes": [],
         "current_index": 0,
     })
+
     try:
         upsert_viewer_via_api(st.session_state.users[vname]["settings"], viewer_id=vname)
     except Exception as e:
         st.error(f"Failed to upsert viewer: {e}")
         return
+
     st.session_state.active_user = vname
+
     try:
         disk = hydrate_interactions_for_viewer_remote(vname)
         u = st.session_state.users.get(vname)
@@ -571,6 +608,7 @@ def switch_to_profile_as_viewer(profile_row: pd.Series):
         u["superlikes"] = sorted(set(u.get("superlikes", [])) | set(disk.get("superlikes", [])))
     except Exception as e:
         st.error(f"Failed to load interaction history for {vname}: {e}")
+
     st.session_state.grid_page = 1
 
 def rehydrate_current_viewer_merge():
@@ -590,11 +628,11 @@ def rehydrate_current_viewer_merge():
 # App UI / Main
 # ================================================================
 st.title("Recommendation (Endpoint-driven)")
-st.caption("Interactions and viewers persist via API endpoints only. Profiles are loaded from backend (Supabase).")
+st.caption("Interactions and viewers persist via API endpoints only. Profiles still load from local CSV.")
 
 def health_banner():
     ok_api = False
-    ok_get_profiles = False
+    ok_get_interactions = False
     try:
         r = requests.get(API_BASE.rstrip("/") + "/", timeout=3.0)
         ok_api = (r.status_code < 400)
@@ -602,31 +640,31 @@ def health_banner():
         ok_api = False
 
     try:
-        r2 = requests.get(urljoin(API_BASE.rstrip("/") + "/", f"get_profiles"), timeout=3.0)
-        ok_get_profiles = (r2.status_code < 400)
+        r2 = requests.get(urljoin(API_BASE.rstrip("/") + "/", f"get_interactions/{st.session_state.active_user}"), timeout=3.0)
+        ok_get_interactions = (r2.status_code < 400)
     except Exception:
-        ok_get_profiles = False
+        ok_get_interactions = False
 
     st.info(
         f"Backend API: {'✅' if ok_api else '⚠️'} {API_BASE}\n\n"
-        f"Get profiles endpoint: {'✅' if ok_get_profiles else '⚠️'}"
+        f"Get interactions endpoint: {'✅' if ok_get_interactions else '⚠️'}"
     )
 
 health_banner()
 
-# Viewer selection UI
+# Viewer selection
 with st.container():
     st.subheader("Login as any profile")
     df_choices = st.session_state.profiles_df.reset_index(drop=True)
     if df_choices.empty:
-        st.warning("No profiles loaded. Check your backend get_profiles endpoint.")
+        st.warning("No profiles loaded. Check your profiles.csv path in the sidebar and reload.")
     else:
         labels = [
             f"{r['name']} ({r['id']}) — {r['city']}, {r['country']}"
             for _, r in df_choices.iterrows()
         ]
         default_ix = st.session_state.get("pick_profile_ix", 0)
-        default_ix = min(default_ix, len(labels) - 1)
+        default_ix = min(default_ix, max(0, len(labels) - 1))
         def _on_pick_profile_as_viewer():
             ix = st.session_state["pick_profile_ix"]
             pr = df_choices.iloc[ix]
@@ -640,10 +678,10 @@ with st.container():
             on_change=_on_pick_profile_as_viewer,
         )
 
-# Sidebar with settings
+# Sidebar
 with st.sidebar:
     st.header("Viewer Settings")
-    ustate = st.session_state.users[st.session_state.active_user]
+    ustate = get_active()
     s = ustate["settings"]
     generator_interests = compute_all_interests_from_profiles(st.session_state.profiles_df)
     dataset_cities = sorted(st.session_state.profiles_df["city"].dropna().unique().tolist()) if not st.session_state.profiles_df.empty else []
@@ -677,16 +715,15 @@ with st.sidebar:
 
     st.divider()
     st.subheader("Profiles")
-    st.caption("Profiles are loaded from the backend.")
-    if st.button("🔄 Reload profiles from server"):
-        try:
-            st.session_state.profiles_df = fetch_profiles_remote(API_BASE)
-            st.session_state.ranked_cache.clear()
-            for uname in st.session_state.users:
-                st.session_state.users[uname]["current_index"] = 0
-            st.success(f"Loaded {len(st.session_state.profiles_df)} profiles from backend")
-        except Exception as e:
-            st.error(f"Failed to fetch profiles: {e}")
+    st.caption("Profiles are loaded from the static CSV below.")
+    st.text_input("Profiles CSV path", key="profiles_csv", value=st.session_state.get("profiles_csv", "./profiles.csv"))
+    if st.button("🔄 Reload profiles from CSV"):
+        mt = _file_mtime(st.session_state.profiles_csv)
+        st.session_state.profiles_df = load_profiles_cached(st.session_state.profiles_csv, mt)
+        st.session_state.ranked_cache.clear()
+        for uname in st.session_state.users:
+            st.session_state.users[uname]["current_index"] = 0
+        st.success(f"Loaded {len(st.session_state.profiles_df)} profiles from {st.session_state.profiles_csv}")
 
     st.divider()
     st.subheader("Performance")
@@ -705,36 +742,35 @@ with st.sidebar:
 
 # Ranking & display
 sort_by = st.selectbox("Sort by", ["Best match", "Nearest", "Shuffle"], index=0)
-df_ranked = get_ranked_profiles(st.session_state.profiles_df, st.session_state.users[st.session_state.active_user]["settings"], sort_by, st.session_state.active_user)
+df_ranked = get_ranked_profiles(st.session_state.profiles_df, get_active()["settings"], sort_by, st.session_state.active_user)
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Profiles available", len(df_ranked))
-m2.metric("Likes", len(st.session_state.users[st.session_state.active_user].get("likes", [])))
-superlikes_count = len(st.session_state.users.get(st.session_state.active_user, {}).get("superlikes", []))
-m3.metric("Superlikes", superlikes_count)
-m4.metric("Passes", len(st.session_state.users[st.session_state.active_user].get("passes", [])))
+m2.metric("Likes", len(get_active()["likes"]))
+m3.metric("Superlikes", len(get_active()["superlikes"]))
+m4.metric("Passes", len(get_active()["passes"]))
 
 tabs = st.tabs(["Browse", "Grid", "Likes & Passes", "Debug"])
 
 with tabs[0]:
     st.subheader("Swipe-ish")
-    idx = st.session_state.users[st.session_state.active_user]["current_index"]
+    idx = get_active()["current_index"]
     if idx >= len(df_ranked) or df_ranked.empty:
         st.success("You're all caught up! Adjust filters or reload profiles.")
     else:
         row = df_ranked.iloc[idx]
         profile_card(row, show_image=True)
-        action_bar(row, st.session_state.users[st.session_state.active_user])
+        action_bar(row, get_active())
 
 with tabs[1]:
     st.subheader("All Profiles (paginated)")
     if df_ranked.empty:
-        st.info("No profiles to show. Reload your profiles from backend or relax filters.")
+        st.info("No profiles to show. Reload your profiles CSV or relax filters.")
     else:
         total = len(df_ranked)
         per_page = int(st.session_state.grid_page_size)
         total_pages = max((total + per_page - 1) // per_page, 1)
-        left, mid, right = st.columns([1, 2, 1])
+        left, mid, right = st.columns([1,2,1])
         with left:
             if st.button("⬅️ Prev", disabled=(st.session_state.grid_page <= 1)):
                 st.session_state.grid_page = max(1, st.session_state.grid_page - 1)
@@ -766,18 +802,18 @@ with tabs[1]:
                         st.caption(f"📍 {r['city']} • ~{r['distance_km']} km • Compat {r['compatibility']:.2f}")
                         if isinstance(r["interests"], list):
                             st.caption(", ".join(r["interests"]))
-                        c1, c2, c3 = st.columns([1, 1, 1])
+                        c1, c2, c3 = st.columns([1,1,1])
                         with c1:
                             if st.button("❤️", key=f"grid_like_{st.session_state.active_user}_{r['id']}_{start}"):
-                                if r["id"] not in st.session_state.users[st.session_state.active_user]["likes"]:
-                                    st.session_state.users[st.session_state.active_user]["likes"].append(r["id"])
-                                log_interaction(st.session_state.active_user, st.session_state.users[st.session_state.active_user]["settings"]["name"], r, "like", r.get("compatibility", 0.0))
+                                if r["id"] not in get_active()["likes"]:
+                                    get_active()["likes"].append(r["id"])
+                                log_interaction(st.session_state.active_user, get_active()["settings"]["name"], r, "like", r.get("compatibility", 0.0))
                                 rehydrate_current_viewer_merge()
                         with c2:
                             if st.button("👎", key=f"grid_pass_{st.session_state.active_user}_{r['id']}_{start}"):
-                                if r["id"] not in st.session_state.users[st.session_state.active_user]["passes"]:
-                                    st.session_state.users[st.session_state.active_user]["passes"].append(r["id"])
-                                log_interaction(st.session_state.active_user, st.session_state.users[st.session_state.active_user]["settings"]["name"], r, "pass", r.get("compatibility", 0.0))
+                                if r["id"] not in get_active()["passes"]:
+                                    get_active()["passes"].append(r["id"])
+                                log_interaction(st.session_state.active_user, get_active()["settings"]["name"], r, "pass", r.get("compatibility", 0.0))
                                 rehydrate_current_viewer_merge()
                         with c3:
                             if st.button("👤 View as", key=f"grid_viewas_{r['id']}_{start}"):
@@ -785,16 +821,16 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Your Decisions")
-    ustate = st.session_state.users[st.session_state.active_user]
+    ustate = get_active()
     base_df = st.session_state.profiles_df
-    liked_ids = set(ustate.get("likes", []) + ustate.get("superlikes", []))
-    passed_ids = set(ustate.get("passes", []))
+    liked_ids = set(ustate["likes"] + ustate["superlikes"])
+    passed_ids = set(ustate["passes"])
     liked_df = base_df[base_df["id"].isin(liked_ids)].copy()
     passed_df = base_df[base_df["id"].isin(passed_ids)].copy()
     if not liked_df.empty:
-        liked_df = liked_df.merge(df_ranked[["id", "compatibility"]], on="id", how="left")
+        liked_df = liked_df.merge(df_ranked[["id","compatibility"]], on="id", how="left")
     if not passed_df.empty:
-        passed_df = passed_df.merge(df_ranked[["id", "compatibility"]], on="id", how="left")
+        passed_df = passed_df.merge(df_ranked[["id","compatibility"]], on="id", how="left")
     c1, c2 = st.columns(2)
     with c1:
         st.markdown("### ❤️ Likes & ⭐ Superlikes")
@@ -822,9 +858,8 @@ with tabs[2]:
 with tabs[3]:
     st.subheader("Debug / Developer Hooks")
     st.write("**Active viewer settings**")
-    st.json(st.session_state.users[st.session_state.active_user]["settings"])
-
-    st.markdown("**Current dataset (ranked for this viewer) — showing first 200 rows**")
+    st.json(get_active()["settings"])
+    st.write("**Current dataset (ranked for this viewer) — showing first 200 rows**")
     st.dataframe(df_ranked.head(200), width='stretch')
 
     st.markdown("**Recent interactions (active viewer) — fetched from server**")
@@ -857,4 +892,5 @@ with tabs[3]:
 
     st.info(
         f"API base → {API_BASE}\n\n"
+        f"Profiles CSV → {st.session_state.profiles_csv}"
     )
